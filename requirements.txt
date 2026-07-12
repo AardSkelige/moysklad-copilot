@@ -1,0 +1,18 @@
+aiogram==3.25.0
+sqlalchemy==2.0.36
+aiosqlite==0.20.0
+greenlet==3.1.1
+python-dotenv==1.0.1
+openpyxl==3.1.5
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# AI агент (производство)
+httpx==0.27.2
+openai==1.54.4
+groq==0.13.0
+
+# Аудит учёта
+aiohttp==3.10.10
+apscheduler==3.10.4
+certifi==2024.8.30

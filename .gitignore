@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.env.local
+
+# Database
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# External documentation (git submodule alternative)
+docs/moysklad-api-docs/
+
+# Internal business data — never published
+docs/internal/
+services/audit/team_context_local.py
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
+.claude/

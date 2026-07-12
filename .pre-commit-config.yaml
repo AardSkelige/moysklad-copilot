@@ -1,0 +1,10 @@
+# Защита от случайного коммита секретов.
+# Установка: pip install pre-commit && brew install gitleaks && pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks — скан staged-изменений на секреты
+        entry: gitleaks protect --staged --redact
+        language: system
+        pass_filenames: false
