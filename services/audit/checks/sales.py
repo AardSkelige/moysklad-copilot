@@ -133,8 +133,12 @@ class DemandOverheadPaymentCheck(CheckSpec):
     """Накладные расходы отгрузки без парного платежа на ту же сумму.
 
     Стандарт владельца: сумма накладных расходов отгрузки (доставка) должна
-    существовать отдельным исходящим платежом/РКО; напрямую документы не
-    связываются (это сломало бы склад), связь — по сумме и комментарию."""
+    существовать отдельным исходящим платежом/РКО с галкой «Без закрывающих
+    документов» и БЕЗ привязки к отгрузке/заказу (привязка ломает баланс
+    контрагента — это не деньги за товар); связь — по сумме и комментарию.
+
+    Исключение — СДЭК: выставляет сводный счёт за период, парного платежа
+    на сумму конкретной отгрузки не бывает, такие отгрузки не сигналим."""
 
     id = 'demand_overhead_payment'
     section = Section.SALES
@@ -143,6 +147,14 @@ class DemandOverheadPaymentCheck(CheckSpec):
     supports_incremental = False   # сверка сумм по всему окну
 
     _MATCH_WINDOW_DAYS = 21
+
+    @staticmethod
+    def _delivery_method(d: dict) -> str | None:
+        for a in (d.get('attributes') or []):
+            if a.get('name') == 'Способ доставки':
+                v = a.get('value')
+                return v.get('name') if isinstance(v, dict) else (str(v) if v else None)
+        return None
 
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
         demands = await ctx.client.list_entities(
@@ -166,6 +178,10 @@ class DemandOverheadPaymentCheck(CheckSpec):
         for d in demands:
             overhead = (d.get('overhead') or {}).get('sum', 0)
             if overhead <= 0:
+                continue
+            delivery = self._delivery_method(d)
+            if delivery and 'сдэк' in delivery.lower():
+                # СДЭК выставляет сводный счёт — парного платежа не бывает
                 continue
             try:
                 d_moment = parse_moment(d['moment'])
@@ -198,12 +214,22 @@ class DemandOverheadPaymentCheck(CheckSpec):
                     'agent': ((d.get('agent') or {}).get('name')
                               if isinstance(d.get('agent'), dict) else None),
                     'overhead_kopecks': overhead,
+                    'delivery_method': delivery,
                     'description': (d.get('description') or '')[:300],
                     'note': (f'В отгрузке №{d["name"]} указаны накладные расходы '
-                             f'{overhead / 100:.2f} ₽, но исходящего платежа/РКО '
-                             f'на эту сумму (±{self._MATCH_WINDOW_DAYS} дн.) не найдено. '
-                             f'Либо оплату доставки забыли провести в Деньгах, '
-                             f'либо сумма накладных вписана неточно.'),
+                             f'{overhead / 100:.2f} ₽'
+                             + (f' (способ доставки: {delivery})' if delivery else '')
+                             + f', но исходящего платежа/РКО на эту сумму '
+                             f'(±{self._MATCH_WINDOW_DAYS} дн.) не найдено.'),
+                    'fix_hint': ('Стандарт: платёж за доставку — ОТДЕЛЬНЫЙ исходящий '
+                                 'платёж или РКО с галкой «Без закрывающих документов», '
+                                 'БЕЗ привязки к отгрузке или заказу (привязка сломает '
+                                 'баланс контрагента — это не деньги за товар). '
+                                 'Если оплата была — создать такой платёж на перевозчика '
+                                 '(create_payment, статья расходов «Логистика»), связь '
+                                 'с отгрузкой только через комментарий. НИКОГДА не '
+                                 'предлагай привязывать платёж за доставку к документам. '
+                                 'Если сумма накладных ошибочна — убрать её из отгрузки.'),
                 },
                 fingerprint_salt=str(overhead),
                 ui_link=(d.get('meta') or {}).get('uuidHref', ''),

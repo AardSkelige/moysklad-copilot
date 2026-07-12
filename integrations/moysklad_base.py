@@ -91,5 +91,8 @@ class MoySkladHTTP:
     async def put(self, session: aiohttp.ClientSession, path: str, payload: dict) -> dict | None:
         return await self.request(session, 'PUT', path, payload=payload)
 
+    async def post(self, session: aiohttp.ClientSession, path: str, payload: dict) -> dict | None:
+        return await self.request(session, 'POST', path, payload=payload)
+
     async def delete(self, session: aiohttp.ClientSession, path: str) -> None:
         await self.request(session, 'DELETE', path)

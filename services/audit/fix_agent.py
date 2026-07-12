@@ -110,6 +110,31 @@ TOOLS = [
     {
         'type': 'function',
         'function': {
+            'name': 'search_counterparty',
+            'description': ('Найти контрагента по названию (например перевозчика: '
+                            '«Boxberry», «Почта России»). Возвращает имя и href для '
+                            'подстановки в create_payment.'),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'name': {'type': 'string', 'description': 'Часть названия контрагента'},
+                },
+                'required': ['name'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'list_expense_items',
+            'description': ('Справочник статей расходов (имя + href) — для выбора '
+                            'expense_item_href в create_payment. Доставка — статья «Логистика».'),
+            'parameters': {'type': 'object', 'properties': {}},
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'prepare_fix',
             'description': (
                 'Финальный шаг: подготовить исправление. НЕ применяет изменения — '
@@ -122,7 +147,11 @@ TOOLS = [
                 'set_applicable {entity_type, entity_id, applicable}; '
                 'set_no_closing_docs {entity_type: paymentout|cashout, entity_id} — '
                 'галка «Без закрывающих документов» для платежей за услуги; '
-                'delete_document {entity_type, entity_id}.'
+                'delete_document {entity_type, entity_id}; '
+                'create_payment {entity_type: paymentout|cashout, agent_href, '
+                'sum_kopecks, expense_item_href, purpose, description} — создать '
+                'платёж за услуги (доставку): всегда с галкой «Без закрывающих '
+                'документов», БЕЗ привязки к документам.'
             ),
             'parameters': {
                 'type': 'object',
@@ -133,15 +162,20 @@ TOOLS = [
                         'items': {
                             'type': 'object',
                             'properties': {
-                                'action': {'type': 'string', 'enum': ['set_description', 'set_position_price', 'set_applicable', 'set_no_closing_docs', 'delete_document']},
+                                'action': {'type': 'string', 'enum': ['set_description', 'set_position_price', 'set_applicable', 'set_no_closing_docs', 'delete_document', 'create_payment']},
                                 'entity_type': {'type': 'string'},
-                                'entity_id': {'type': 'string'},
+                                'entity_id': {'type': 'string', 'description': 'Не нужен для create_payment'},
                                 'text': {'type': 'string'},
                                 'position_id': {'type': 'string'},
                                 'price_kopecks': {'type': 'number'},
                                 'applicable': {'type': 'boolean'},
+                                'agent_href': {'type': 'string', 'description': 'create_payment: href контрагента-перевозчика'},
+                                'sum_kopecks': {'type': 'number', 'description': 'create_payment: сумма в копейках'},
+                                'expense_item_href': {'type': 'string', 'description': 'create_payment: href статьи расходов'},
+                                'purpose': {'type': 'string', 'description': 'create_payment: назначение платежа'},
+                                'description': {'type': 'string', 'description': 'create_payment: комментарий (укажи отгрузку)'},
                             },
-                            'required': ['action', 'entity_type', 'entity_id'],
+                            'required': ['action', 'entity_type'],
                         },
                     },
                 },
@@ -179,6 +213,13 @@ def _general_system_prompt() -> str:
         'Правила:\n'
         '• Не выдумывай данные — сначала возьми их через tools.\n'
         '• Суммы и цены в МойСклад — в КОПЕЙКАХ; пользователю показывай в рублях.\n'
+        '• Платежи за услуги/доставку НИКОГДА не привязывай к отгрузкам и заказам — '
+        'это ломает баланс контрагента (не деньги за товар). Такой платёж создаётся '
+        'отдельно (create_payment) с галкой «Без закрывающих документов»: контрагент — '
+        'перевозчик (найди через search_counterparty), статья расходов — из '
+        'list_expense_items (доставка → «Логистика»), в комментарии укажи отгрузку. '
+        'Перед prepare_fix уточни у владельца: платили с расчётного счёта (paymentout) '
+        'или наличными/картой (cashout), и подтверди контрагента.\n'
         '• «Скрытые» находки (ignored) — это те, что ИИ-аналитик счёл нормой, плюс те, '
         'что владелец скрыл кнопками «Игнорировать»/«Это норм».\n'
         '• Отвечай ПЛОСКИМ ТЕКСТОМ без Markdown (без **, *, #, `). Списки — «1. … 2. …». '
@@ -197,6 +238,13 @@ def _system_prompt(finding_context: dict) -> str:
         'Правила:\n'
         '• Сначала пойми ситуацию (get_document / get_positions / get_audit_events), потом советуй.\n'
         '• Суммы и цены в МойСклад — в КОПЕЙКАХ; пользователю показывай в рублях.\n'
+        '• Платежи за услуги/доставку НИКОГДА не привязывай к отгрузкам и заказам — '
+        'это ломает баланс контрагента (не деньги за товар). Такой платёж создаётся '
+        'отдельно (create_payment) с галкой «Без закрывающих документов»: контрагент — '
+        'перевозчик (search_counterparty), статья расходов — из list_expense_items '
+        '(доставка → «Логистика»), в комментарии укажи отгрузку. Перед prepare_fix '
+        'уточни у владельца: платили с расчётного счёта (paymentout) или '
+        'наличными/картой (cashout), и подтверди контрагента.\n'
         '• prepare_fix вызывай ТОЛЬКО после явного согласия владельца на конкретный вариант. '
         'После prepare_fix не продолжай диалог — владелец подтвердит кнопкой.\n'
         '• Если исправление не выражается допустимыми действиями (например, нужно создать '
@@ -335,6 +383,25 @@ class FixAgent:
                 } for r in runs],
             }, ensure_ascii=False), None
 
+        async def search_counterparty(args):
+            name = (args.get('name') or '').strip()
+            if not name:
+                return json.dumps({'error': 'Пустое название'}, ensure_ascii=False), None
+            async with aiohttp.ClientSession() as s:
+                rows = await client.list_entities(
+                    s, 'counterparty', filters=f'name~{name}', max_rows=8)
+            out = [{'name': r.get('name'), 'agent_href': (r.get('meta') or {}).get('href')}
+                   for r in rows]
+            return json.dumps({'counterparties': out}, ensure_ascii=False), None
+
+        async def list_expense_items(args):
+            async with aiohttp.ClientSession() as s:
+                rows = await client.list_entities(s, 'expenseitem', max_rows=50)
+            out = [{'name': r.get('name'),
+                    'expense_item_href': (r.get('meta') or {}).get('href')}
+                   for r in rows]
+            return json.dumps({'expense_items': out}, ensure_ascii=False), None
+
         async def prepare_fix(args):
             actions = args.get('actions') or []
             error = validate_actions(actions)
@@ -355,6 +422,8 @@ class FixAgent:
             'list_findings': list_findings,
             'close_finding': close_finding,
             'get_audit_stats': get_audit_stats,
+            'search_counterparty': search_counterparty,
+            'list_expense_items': list_expense_items,
             'prepare_fix': prepare_fix,
         }
 

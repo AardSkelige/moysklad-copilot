@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+from core import config
 from core.logger import logger
 from integrations.moysklad_audit import MoySkladAuditClient
 
@@ -18,6 +19,11 @@ ALLOWED_ACTIONS = {
     'set_applicable',        # {entity_type, entity_id, applicable: bool} — провести/распровести
     'set_no_closing_docs',   # {entity_type: paymentout|cashout, entity_id} — галка «Без закрывающих документов»
     'delete_document',       # {entity_type, entity_id}
+    # Создать платёж за услуги (доставка и т.п.): всегда noClosingDocs=true,
+    # БЕЗ привязок к документам — иначе ломается баланс контрагента.
+    # {entity_type: paymentout|cashout, agent_href, sum_kopecks,
+    #  expense_item_href, purpose?, description?}
+    'create_payment',
 }
 
 ALLOWED_ENTITIES = {
@@ -33,6 +39,7 @@ _ACTION_LABELS = {
     'set_applicable': '📌 Провести/распровести',
     'set_no_closing_docs': '🏷 Галка «Без закрывающих документов»',
     'delete_document': '🗑 Удалить документ',
+    'create_payment': '➕ Создать платёж (без закрывающих документов, без привязок)',
 }
 
 
@@ -54,6 +61,10 @@ class FixPreview:
                 detail = f': {a.get("price_kopecks", 0) / 100:,.2f} ₽'.replace(',', ' ')
             elif a.get('action') == 'set_applicable':
                 detail = ': провести' if a.get('applicable') else ': распровести'
+            elif a.get('action') == 'create_payment':
+                target = 'Платёж' if a.get('entity_type') == 'paymentout' else 'РКО'
+                amount = f'{a.get("sum_kopecks", 0) / 100:,.2f}'.replace(',', ' ')
+                detail = f': {amount} ₽ — «{(a.get("purpose") or "")[:80]}»'
             lines.append(f'• {label} ({target}){detail}')
         return '\n'.join(lines)
 
@@ -67,6 +78,17 @@ def validate_actions(actions: list[dict]) -> str | None:
             return f'Недопустимое действие: {a.get("action")}'
         if a.get('entity_type') not in ALLOWED_ENTITIES:
             return f'Недопустимый тип сущности: {a.get("entity_type")}'
+        if a['action'] == 'create_payment':
+            if a['entity_type'] not in ('paymentout', 'cashout'):
+                return 'create_payment создаёт только исходящий платёж или РКО'
+            s = a.get('sum_kopecks')
+            if not isinstance(s, (int, float)) or s <= 0 or int(s) != s:
+                return 'create_payment: сумма должна быть целым числом копеек > 0'
+            for key in ('agent_href', 'expense_item_href'):
+                href = a.get(key) or ''
+                if not href.startswith(f'{config.MOYSKLAD_BASE_URL}/entity/'):
+                    return f'create_payment: некорректный {key}'
+            continue  # entity_id не нужен — документ создаётся
         if not a.get('entity_id'):
             return 'Не указан entity_id'
         if a['action'] == 'set_description' and not (a.get('text') or '').strip():
@@ -119,8 +141,13 @@ class ErrorFixService:
         results = []
         async with aiohttp.ClientSession() as session:
             for a in preview.actions:
-                entity, entity_id = a['entity_type'], a['entity_id']
                 action = a['action']
+                if action == 'create_payment':
+                    results.append(await self._create_payment(session, a))
+                    logger.info(f'[fix] create_payment {a["entity_type"]} '
+                                f'{a["sum_kopecks"]} коп.')
+                    continue
+                entity, entity_id = a['entity_type'], a['entity_id']
                 label = await self._doc_label(session, entity, entity_id)
                 if action == 'set_description':
                     await self.client.update_entity(session, entity, entity_id,
@@ -146,6 +173,29 @@ class ErrorFixService:
                     results.append(f'{label}: удалён')
                 logger.info(f'[fix] {action} {entity}/{entity_id}')
         return results
+
+    async def _create_payment(self, session, a: dict) -> str:
+        """Платёж за услуги: noClosingDocs, проведён, без привязок к документам."""
+        def _meta(href: str, mtype: str) -> dict:
+            return {'meta': {'href': href, 'type': mtype, 'mediaType': 'application/json'}}
+
+        payload = {
+            'organization': _meta(config.MOYSKLAD_ORGANIZATION_HREF, 'organization'),
+            'agent': _meta(a['agent_href'], 'counterparty'),
+            'expenseItem': _meta(a['expense_item_href'], 'expenseitem'),
+            'sum': int(a['sum_kopecks']),
+            'noClosingDocs': True,
+            'applicable': True,
+        }
+        if (a.get('purpose') or '').strip():
+            payload['paymentPurpose'] = a['purpose'].strip()
+        if (a.get('description') or '').strip():
+            payload['description'] = a['description'].strip()
+        created = await self.client.create_entity(session, a['entity_type'], payload)
+        label = _RU_ENTITY.get(a['entity_type'], a['entity_type'])
+        amount = f'{a["sum_kopecks"] / 100:,.2f}'.replace(',', ' ')
+        return (f'{label} №{(created or {}).get("name", "?")} создан: {amount} ₽, '
+                f'галка «Без закрывающих документов», без привязок')
 
 
 def fix_preview_to_state(preview: FixPreview) -> dict:

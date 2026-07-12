@@ -321,6 +321,32 @@ class TestDemandOverheadPayment:
                                       'cashout': []}))
         assert await DemandOverheadPaymentCheck().detect(ctx, None) == []
 
+    async def test_sdek_delivery_excluded(self):
+        # СДЭК выставляет сводный счёт — парного платежа на отгрузку не бывает
+        from services.audit.checks.sales import DemandOverheadPaymentCheck
+        demand = _doc('demand', 'd6', '00087', '2026-05-12 10:00:00', sum=150000,
+                      overhead={'sum': 51941},
+                      attributes=[{'name': 'Способ доставки',
+                                   'value': {'name': 'СДЭК (ПВЗ)'}}])
+        ctx = FakeContext(FakeClient({'demand': [demand], 'paymentout': [],
+                                      'cashout': []}))
+        assert await DemandOverheadPaymentCheck().detect(ctx, None) == []
+
+    async def test_other_delivery_method_flagged_with_payload(self):
+        # Живой кейс №00086 (Озон ПВЗ): накладные 1638 ₽ без парного платежа
+        from services.audit.checks.sales import DemandOverheadPaymentCheck
+        demand = _doc('demand', 'd7', '00086', '2026-05-12 10:00:00', sum=500000,
+                      overhead={'sum': 163800},
+                      attributes=[{'name': 'Способ доставки',
+                                   'value': {'name': 'Озон (ПВЗ)'}}])
+        ctx = FakeContext(FakeClient({'demand': [demand], 'paymentout': [],
+                                      'cashout': []}))
+        found = await DemandOverheadPaymentCheck().detect(ctx, None)
+        assert len(found) == 1
+        assert found[0].payload['delivery_method'] == 'Озон (ПВЗ)'
+        assert 'БЕЗ привязки' in found[0].payload['fix_hint']
+        assert 'create_payment' in found[0].payload['fix_hint']
+
 
 class TestRetroEdit:
     async def test_detects_retro_edited_supply(self):

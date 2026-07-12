@@ -102,3 +102,8 @@ class MoySkladAuditClient:
         self, session: aiohttp.ClientSession, entity: str, entity_id: str
     ) -> None:
         await self.http.delete(session, f'/entity/{entity}/{entity_id}')
+
+    async def create_entity(
+        self, session: aiohttp.ClientSession, entity: str, payload: dict
+    ) -> dict | None:
+        return await self.http.post(session, f'/entity/{entity}', payload)

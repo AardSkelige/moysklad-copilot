@@ -161,3 +161,83 @@ class TestFixValidation:
         msg = preview.to_telegram_message()
         assert 'Проставить цену этикетки' in msg
         assert '250.00' in msg.replace(' ', '')
+
+
+_MS = 'https://api.moysklad.ru/api/remap/1.2'
+
+
+def _create_payment_action(**over):
+    a = {
+        'action': 'create_payment', 'entity_type': 'paymentout',
+        'agent_href': f'{_MS}/entity/counterparty/c1',
+        'expense_item_href': f'{_MS}/entity/expenseitem/e1',
+        'sum_kopecks': 163800,
+        'purpose': 'Доставка по отгрузке № 00086',
+        'description': 'Катя: доставка по отгрузке №00086.',
+    }
+    a.update(over)
+    return a
+
+
+class TestCreatePayment:
+    async def test_valid_paymentout_and_cashout(self):
+        assert validate_actions([_create_payment_action()]) is None
+        assert validate_actions([_create_payment_action(entity_type='cashout')]) is None
+
+    async def test_entity_id_not_required(self):
+        # документ создаётся — entity_id не существует
+        assert validate_actions([_create_payment_action()]) is None
+
+    async def test_rejects_wrong_entity_type(self):
+        assert validate_actions([_create_payment_action(entity_type='paymentin')]) is not None
+
+    async def test_rejects_bad_sum(self):
+        assert validate_actions([_create_payment_action(sum_kopecks=0)]) is not None
+        assert validate_actions([_create_payment_action(sum_kopecks=-5)]) is not None
+        assert validate_actions([_create_payment_action(sum_kopecks=163800.5)]) is not None
+
+    async def test_accepts_integral_float_sum(self):
+        # JSON из LLM может прийти как 163800.0
+        assert validate_actions([_create_payment_action(sum_kopecks=163800.0)]) is None
+
+    async def test_rejects_foreign_hrefs(self):
+        assert validate_actions([_create_payment_action(
+            agent_href='https://evil.example.com/entity/counterparty/c1')]) is not None
+        assert validate_actions([_create_payment_action(expense_item_href='')]) is not None
+
+    async def test_apply_builds_unlinked_no_closing_docs_payload(self):
+        from services.audit.fix_service import ErrorFixService
+
+        class FakeClient:
+            def __init__(self):
+                self.created = []
+
+            async def create_entity(self, session, entity, payload):
+                self.created.append((entity, payload))
+                return {'name': '00099'}
+
+        fake = FakeClient()
+        service = ErrorFixService(client=fake)
+        preview = FixPreview(finding_id=1, summary='Создать платёж за доставку',
+                             actions=[_create_payment_action()])
+        results = await service.apply(preview)
+
+        entity, payload = fake.created[0]
+        assert entity == 'paymentout'
+        assert payload['noClosingDocs'] is True
+        assert payload['applicable'] is True
+        assert payload['sum'] == 163800
+        assert 'operations' not in payload   # без привязок к документам
+        assert payload['agent']['meta']['href'].endswith('/counterparty/c1')
+        assert payload['expenseItem']['meta']['href'].endswith('/expenseitem/e1')
+        assert payload['paymentPurpose'] == 'Доставка по отгрузке № 00086'
+        assert '00099' in results[0]
+
+    async def test_preview_message_shows_sum_and_purpose(self):
+        preview = FixPreview(finding_id=1, summary='Платёж за доставку', actions=[
+            _create_payment_action(),
+        ])
+        msg = preview.to_telegram_message()
+        assert '1638.00' in msg.replace(' ', '')
+        assert 'Доставка по отгрузке № 00086' in msg
+        assert 'закрывающих' in msg
