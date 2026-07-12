@@ -51,8 +51,7 @@ Python 3.12 · aiogram 3 · SQLAlchemy 2 (async SQLite) · aiohttp · APSchedule
 ```bash
 cp .env.example .env          # заполнить токены и ID
 pip install -r requirements.txt
-python scripts/seed_categories.py   # схема БД + категории
-python main.py
+python main.py                # схема БД создаётся автоматически
 ```
 
 Docker: `docker compose up -d`. Деплой на сервер: `./deploy.sh` (адрес — в `DEPLOY_SERVER`).
