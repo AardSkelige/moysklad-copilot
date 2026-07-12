@@ -102,6 +102,8 @@ class AuditRunner:
         fp = fingerprint(check.id, raw)
         seen.add(fp)
 
+        retriage_id = None
+        stored: dict = {}
         async with session_scope() as db:
             if await self._is_muted(db, check.id, raw.entity_id):
                 return None
@@ -121,9 +123,27 @@ class AuditRunner:
                 if fresh_comment is not None and stored.get('description') != fresh_comment:
                     stored['description'] = fresh_comment
                     changed = True
+                # note/fix_hint изменились (обновили правила проверки) — старый
+                # вердикт LLM устарел, переанализируем с новыми подсказками
+                if any(raw.payload.get(k) is not None and stored.get(k) != raw.payload.get(k)
+                       for k in ('note', 'fix_hint')):
+                    stored.update({k: v for k, v in raw.payload.items() if v is not None})
+                    retriage_id = existing.id
+                    changed = True
                 if changed:
                     existing.payload = json.dumps(stored, ensure_ascii=False, default=str)
-                return None
+
+        if retriage_id is not None and check.llm_triage and self.analyst is not None:
+            verdict = await self.analyst.triage(check.title, stored)
+            if verdict is not None:
+                async with session_scope() as db:
+                    f = await db.get(Finding, retriage_id)
+                    if f is not None:
+                        p = json.loads(f.payload or '{}')
+                        p['llm'] = verdict
+                        f.payload = json.dumps(p, ensure_ascii=False, default=str)
+        if existing is not None:
+            return None   # уже тревожили — повторно не уведомляем
 
         # Новый сигнал: нюансные случаи отдаём на суждение LLM-аналитику
         verdict = None

@@ -194,8 +194,10 @@ class ErrorFixService:
         created = await self.client.create_entity(session, a['entity_type'], payload)
         label = _RU_ENTITY.get(a['entity_type'], a['entity_type'])
         amount = f'{a["sum_kopecks"] / 100:,.2f}'.replace(',', ' ')
+        ui_link = ((created or {}).get('meta') or {}).get('uuidHref', '')
         return (f'{label} №{(created or {}).get("name", "?")} создан: {amount} ₽, '
-                f'галка «Без закрывающих документов», без привязок')
+                f'галка «Без закрывающих документов», без привязок'
+                + (f'\n{ui_link}' if ui_link else ''))
 
 
 def fix_preview_to_state(preview: FixPreview) -> dict:

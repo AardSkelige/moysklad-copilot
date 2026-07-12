@@ -142,6 +142,40 @@ class TestRunnerAnalyst:
         new = await _run(runner_module, [StubCheck([_raw()])], analyst=None)
         assert len(new) == 1
 
+    async def test_changed_fix_hint_triggers_retriage(self, audit_env):
+        # Обновили правила проверки (note/fix_hint) — старый вердикт LLM
+        # переанализируется, но владельца повторно не тревожим
+        import json as _json
+        runner_module, factory = audit_env
+        analyst = StubAnalyst()
+
+        old = _raw()
+        old.payload = {'note': 'факты', 'fix_hint': 'старый стандарт'}
+        assert len(await _run(runner_module, [StubCheck([old])], analyst)) == 1
+        assert analyst.calls == 1
+
+        fresh = _raw()
+        fresh.payload = {'note': 'факты', 'fix_hint': 'НОВЫЙ стандарт: не привязывать'}
+        assert await _run(runner_module, [StubCheck([fresh])], analyst) == []
+        assert analyst.calls == 2   # переанализ случился
+
+        async with factory() as s:
+            row = (await s.execute(select(Finding))).scalar_one()
+        payload = _json.loads(row.payload)
+        assert payload['fix_hint'] == 'НОВЫЙ стандарт: не привязывать'
+        assert payload['llm']['explanation'] == 'тестовое объяснение'
+
+    async def test_unchanged_hint_no_retriage(self, audit_env):
+        runner_module, factory = audit_env
+        analyst = StubAnalyst()
+        raw = _raw()
+        raw.payload = {'note': 'факты', 'fix_hint': 'стандарт'}
+        await _run(runner_module, [StubCheck([raw])], analyst)
+        same = _raw()
+        same.payload = {'note': 'факты', 'fix_hint': 'стандарт'}
+        await _run(runner_module, [StubCheck([same])], analyst)
+        assert analyst.calls == 1   # без изменений LLM не дёргаем
+
 
 class TestRunnerLifecycle:
     async def test_resolved_when_vanished_on_full_scan(self, audit_env):
