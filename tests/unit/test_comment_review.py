@@ -77,10 +77,11 @@ class TestReviewDocuments:
         assert await review_documents([_doc()], llm=llm) == []
 
 
-def _demand(doc_id='dm1', comment='', order_comment='', overhead=0.0):
+def _demand(doc_id='dm1', comment='', order_comment='', overhead=0.0, delivery=None):
     return {'entity': 'demand', 'id': doc_id, 'kind': 'demand',
             'label': 'Отгрузка №00030 от 2026-05-21', 'agent': 'Иванова Мария',
             'sum_rub': 0.0, 'comment': comment, 'overhead_rub': overhead,
+            'delivery_method': delivery,
             'order_id': 'o1', 'order_name': '00032', 'order_comment': order_comment}
 
 
@@ -159,6 +160,47 @@ class TestReviewDemands:
         await review_documents([order, _demand()], llm=llm)
         # один вызов LLM — только батч отгрузок; заказ в общий поток не попал
         assert llm.calls == 1
+
+    async def test_overhead_reason_not_cleared(self):
+        # кейс со скрина: комментарий уже поясняет накладные, LLM предложил стереть
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': '',
+            'new_order_comment': None,
+            'reason': 'всё нужное есть в заказе'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_demand(comment='Накладные расходы 0 — самовывоз.')]
+        assert await review_documents(docs, llm=llm) == []
+
+    async def test_sdek_empty_comment_not_filled(self):
+        # СДЭК: единый сводный счёт — пустую отгрузку пояснением накладных не дополняем
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': 'Накладные расходы 0 — доставка СДЭК.',
+            'new_order_comment': None,
+            'reason': 'пояснение нуля'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_demand(delivery='СДЭК (до пункта выдачи)')]
+        assert await review_documents(docs, llm=llm) == []
+
+    async def test_sdek_existing_comment_still_editable(self):
+        # правка стиля существующего текста для СДЭК остаётся разрешённой
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': 'За доставку платила Ира со своего счёта.',
+            'new_order_comment': None,
+            'reason': 'стиль'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_demand(comment='за доставку платила ира', delivery='СДЭК', overhead=350.0)]
+        out = await review_documents(docs, llm=llm)
+        assert len(out) == 1
+
+    async def test_delivery_method_passed_to_llm(self):
+        seen_payloads = []
+
+        class SpyLLM(FakeLLM):
+            async def chat(self, history, tools=None):
+                seen_payloads.append(history[1]['content'])
+                return await super().chat(history, tools)
+
+        llm = SpyLLM([{'content': '[]', 'tool_calls': []}])
+        await review_documents([_demand(delivery='СДЭК')], llm=llm)
+        payload = json.loads(seen_payloads[0])
+        assert payload[0]['способ_доставки'] == 'СДЭК'
 
     async def test_second_demand_of_same_order_does_not_touch_order(self):
         llm = FakeLLM([{'content': json.dumps([

@@ -11,11 +11,13 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from core import config
 from core.logger import logger
+from services.audit import review_tracker
 from services.audit.comment_review import (
     apply_comment, apply_demand, apply_finance, collect_documents,
     collect_finance_documents, refine_comment, refine_demand, refine_finance,
     review_documents, review_finance_documents,
 )
+from shared import session_scope
 from shared.constants import CallbackData, CallbackPrefix
 from shared.filters import IsAuditOwnerFilter
 from shared.states import AuditState
@@ -110,6 +112,11 @@ async def _show_card(message, state: FSMContext):
             reply_markup=audit_menu_keyboard(),
         )
         return
+    try:
+        async with session_scope() as session:
+            await review_tracker.mark_shown(session, queue[idx])
+    except Exception:
+        logger.warning('[comments] не записал показ карточки', exc_info=True)
     await message.answer(_card_text(queue[idx], idx, len(queue)),
                          reply_markup=_card_keyboard())
 
@@ -146,12 +153,13 @@ async def on_comments_start(callback: CallbackQuery, state: FSMContext):
         f'{"несколько минут" if days > 0 else "это займёт заметное время"}…'
     )
     try:
-        if is_finance:
-            docs = await collect_finance_documents(days)
-            suggestions = await review_finance_documents(docs)
-        else:
-            docs = await collect_documents(days)
-            suggestions = await review_documents(docs)
+        docs = await (collect_finance_documents(days) if is_finance
+                      else collect_documents(days))
+        # документ, показанный дважды и не изменившийся, больше не предлагаем
+        async with session_scope() as session:
+            docs = await review_tracker.filter_seen(session, docs)
+        suggestions = await (review_finance_documents(docs) if is_finance
+                             else review_documents(docs))
     except Exception as e:
         logger.exception('comment review failed')
         await progress.edit_text(f'❌ Не получилось: {e}')
@@ -237,6 +245,12 @@ async def on_comment_apply(callback: CallbackQuery, state: FSMContext):
         await callback.answer('Не удалось записать', show_alert=True)
         await callback.message.answer(f'❌ {item["label"]}: {e}')
         return
+    try:
+        # хэш записанного состояния: правка бота не обнуляет счётчик показов
+        async with session_scope() as session:
+            await review_tracker.record_applied(session, item)
+    except Exception:
+        logger.warning('[comments] не записал применённое состояние', exc_info=True)
     await callback.answer('✏️ Заменено')
     await callback.message.edit_reply_markup(reply_markup=None)
     await state.update_data(cmt_idx=idx + 1, cmt_applied=data.get('cmt_applied', 0) + 1)

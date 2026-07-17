@@ -14,7 +14,7 @@ import aiohttp
 from core import config
 from core.logger import logger
 from integrations.moysklad_audit import MoySkladAuditClient
-from services.audit.context import format_moment
+from services.audit.context import delivery_method, format_moment
 from services.audit.team_context import (
     AUTHOR_FINANCE,
     AUTHOR_MARKETPLACE,
@@ -104,6 +104,13 @@ _DEMAND_SYSTEM = (
     f'{MARKETPLACES}), «Накладные расходы 0 — доставку оплачивал получатель.» '
     'Причину собери из комментариев отгрузки и заказа и контрагента; '
     'если причины нигде нет — new_comment оставь null, НЕ выдумывай.\n'
+    '• ЗАПРЕЩЕНО очищать (new_comment="") комментарий, который уже поясняет '
+    'накладные расходы («Накладные расходы 0 — самовывоз.», «За доставку платила …») — '
+    'если он уже соответствует стандарту, верни new_comment=null.\n'
+    '• Способ доставки СДЭК — особый случай: СДЭК выставляет единый сводный счёт '
+    'за период, поэтому пояснять накладные расходы НЕ НУЖНО ни при нуле, ни при '
+    'сумме > 0. В пустой комментарий такой отгрузки ничего не добавляй; уместны '
+    'только правка стиля существующего текста и перенос лишнего в заказ.\n'
     '• Накладные расходы > 0 → комментарий НЕ НУЖЕН: если после удаления дублей '
     'и перенесённого ничего не остаётся — new_comment = "" (пустой). '
     'Исключение: пояснение самих накладных, УЖЕ написанное в исходных комментариях '
@@ -193,6 +200,7 @@ async def collect_documents(days: int) -> list[dict]:
                         'kind': 'demand',
                         'overhead_rub': round(
                             ((d.get('overhead') or {}).get('sum', 0)) / 100, 2),
+                        'delivery_method': delivery_method(d),
                         'order_id': order['id'],
                         'order_name': order.get('name'),
                         'order_comment': (order.get('description') or '').strip(),
@@ -273,6 +281,7 @@ async def _review_demands(docs: list[dict], llm: LLMClient) -> list[dict]:
             'контрагент': d['agent'],
             'сумма_руб': d['sum_rub'],
             'накладные_расходы_руб': d['overhead_rub'],
+            'способ_доставки': d.get('delivery_method'),
             'комментарий_отгрузки': d['comment'],
             'заказ': f'Заказ покупателя №{d["order_name"]}',
             'комментарий_заказа': d['order_comment'],
@@ -298,6 +307,13 @@ async def _review_demands(docs: list[dict], llm: LLMClient) -> list[dict]:
             if new_comment is not None:
                 new_comment = new_comment.strip()
                 if _normalized(new_comment) == _normalized(doc['comment']):
+                    new_comment = None
+                # страховки кодом, что бы LLM ни решил:
+                elif not new_comment and 'накладн' in _normalized(doc['comment']):
+                    # пояснение накладных расходов не стираем
+                    new_comment = None
+                elif new_comment and not doc['comment'] and _is_sdek(doc):
+                    # СДЭК: единый сводный счёт — в пустую отгрузку ничего не пишем
                     new_comment = None
             new_order_comment = (v.get('new_order_comment') or '').strip() or None
             # заказ только дополняем — очистку и «тот же текст» отбрасываем
@@ -346,6 +362,7 @@ async def refine_demand(item: dict, instruction: str, llm: LLMClient | None = No
             'контрагент': item['agent'],
             'сумма_руб': item['sum_rub'],
             'накладные_расходы_руб': item['overhead_rub'],
+            'способ_доставки': item.get('delivery_method'),
             'комментарий_отгрузки_сейчас': item['comment'],
             'заказ': f'Заказ покупателя №{item["order_name"]}',
             'комментарий_заказа_сейчас': item['order_comment'],
@@ -371,6 +388,10 @@ async def refine_demand(item: dict, instruction: str, llm: LLMClient | None = No
 
 def _normalized(text: str) -> str:
     return ' '.join((text or '').lower().split())
+
+
+def _is_sdek(doc: dict) -> bool:
+    return 'сдэк' in (doc.get('delivery_method') or '').lower()
 
 
 def _short_reason(reason: str | None) -> str:

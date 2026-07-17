@@ -20,6 +20,15 @@ def parse_moment(s: str) -> datetime:
     return datetime.strptime(s[:19], '%Y-%m-%d %H:%M:%S')
 
 
+def delivery_method(doc: dict) -> str | None:
+    """Значение доп. поля «Способ доставки» документа (None, если не заполнено)."""
+    for a in (doc.get('attributes') or []):
+        if a.get('name') == 'Способ доставки':
+            v = a.get('value')
+            return v.get('name') if isinstance(v, dict) else (str(v) if v else None)
+    return None
+
+
 class AuditContext:
     def __init__(self, client: MoySkladAuditClient, session: aiohttp.ClientSession):
         self.client = client

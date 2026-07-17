@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 
 from core import config
-from services.audit.context import AuditContext, format_moment, parse_moment
+from services.audit.context import AuditContext, delivery_method, format_moment, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 
@@ -148,14 +148,6 @@ class DemandOverheadPaymentCheck(CheckSpec):
 
     _MATCH_WINDOW_DAYS = 21
 
-    @staticmethod
-    def _delivery_method(d: dict) -> str | None:
-        for a in (d.get('attributes') or []):
-            if a.get('name') == 'Способ доставки':
-                v = a.get('value')
-                return v.get('name') if isinstance(v, dict) else (str(v) if v else None)
-        return None
-
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
         demands = await ctx.client.list_entities(
             ctx.session, 'demand',
@@ -179,7 +171,7 @@ class DemandOverheadPaymentCheck(CheckSpec):
             overhead = (d.get('overhead') or {}).get('sum', 0)
             if overhead <= 0:
                 continue
-            delivery = self._delivery_method(d)
+            delivery = delivery_method(d)
             if delivery and 'сдэк' in delivery.lower():
                 # СДЭК выставляет сводный счёт — парного платежа не бывает
                 continue

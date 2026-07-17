@@ -1,7 +1,7 @@
 import enum
 
 from sqlalchemy import (
-    Column, DateTime, Integer, String, Boolean, Text, Enum as SAEnum
+    Column, DateTime, Integer, String, Boolean, Text, Enum as SAEnum, UniqueConstraint
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
@@ -85,6 +85,23 @@ class AuditRun(Base):
     error_text = Column(Text, nullable=True)
     findings_new = Column(Integer, nullable=False, default=0)
     api_calls = Column(Integer, nullable=False, default=0)
+
+
+class CommentReviewSeen(Base):
+    """Сколько раз документ показывался в ревью комментариев.
+
+    Документ попадается владельцу не больше двух раз подряд; счётчик обнуляется,
+    если тексты документа с последнего показа изменились (state_hash)."""
+
+    __tablename__ = 'comment_review_seen'
+    __table_args__ = (UniqueConstraint('entity', 'entity_id'),)
+
+    id = Column(Integer, primary_key=True)
+    entity = Column(String, nullable=False)
+    entity_id = Column(String, nullable=False)
+    shown_count = Column(Integer, nullable=False, default=0)
+    state_hash = Column(String, nullable=False, default='')
+    last_shown_at = Column(DateTime, nullable=False)
 
 
 class AuditMute(Base):
