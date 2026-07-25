@@ -21,7 +21,7 @@ MOYSKLAD_BASE_URL = 'https://api.moysklad.ru/api/remap/1.2'
 
 # === AI агент (производство) ===
 DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY', '')
-DEEPSEEK_MODEL = 'deepseek-chat'
+DEEPSEEK_MODEL = 'deepseek-v4-pro'
 DEEPSEEK_BASE_URL = 'https://api.deepseek.com'
 
 GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')

@@ -28,6 +28,9 @@ class LLMClient:
             'model': config.DEEPSEEK_MODEL,
             'messages': messages,
             'temperature': temperature,
+            # v4 — reasoning-модель. Отключаем thinking, чтобы поведение
+            # осталось как у прежней chat-модели (без reasoning-накладных).
+            'extra_body': {'thinking': {'type': 'disabled'}},
         }
         if tools:
             kwargs['tools'] = tools
