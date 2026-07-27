@@ -130,6 +130,10 @@ class AuditRunner:
                     stored.update({k: v for k, v in raw.payload.items() if v is not None})
                     retriage_id = existing.id
                     changed = True
+                # находка застряла без вердикта (LLM был недоступен при создании) —
+                # долечиваем на ближайшем прогоне, иначе владелец видит сырые факты
+                elif 'llm' not in stored and check.llm_triage:
+                    retriage_id = existing.id
                 if changed:
                     existing.payload = json.dumps(stored, ensure_ascii=False, default=str)
 
@@ -142,6 +146,18 @@ class AuditRunner:
                         p = json.loads(f.payload or '{}')
                         p['llm'] = verdict
                         f.payload = json.dumps(p, ensure_ascii=False, default=str)
+                        # свежий вердикт корректирует и статус: если LLM теперь
+                        # счёл нормой — убираем из очереди; важность подтягиваем.
+                        # ACKNOWLEDGED не трогаем — владелец уже взял в работу.
+                        if f.status in (FindingStatus.NEW, FindingStatus.NOTIFIED):
+                            if verdict['verdict'] == 'ok':
+                                f.status = FindingStatus.IGNORED
+                            else:
+                                try:
+                                    f.severity = Severity(
+                                        verdict.get('severity', f.severity)).value
+                                except ValueError:
+                                    pass
         if existing is not None:
             return None   # уже тревожили — повторно не уведомляем
 

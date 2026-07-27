@@ -12,6 +12,17 @@ from services.audit.checks.warehouse import EnterPriceVsFifoCheck, NegativeStock
 from services.audit.specs import CheckSpec
 
 
+_BY_ID: dict[str, CheckSpec] | None = None
+
+
+def registry_by_id() -> dict[str, CheckSpec]:
+    """Проверка по её id — для фолбэк-текста notifier'а, когда вердикта LLM нет."""
+    global _BY_ID
+    if _BY_ID is None:
+        _BY_ID = {c.id: c for c in build_registry()}
+    return _BY_ID
+
+
 def build_registry() -> list[CheckSpec]:
     return [
         SupplyZeroPriceCheck(),

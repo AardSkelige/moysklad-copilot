@@ -176,6 +176,33 @@ class TestRunnerAnalyst:
         await _run(runner_module, [StubCheck([same])], analyst)
         assert analyst.calls == 1   # без изменений LLM не дёргаем
 
+    async def test_missing_llm_healed_on_next_run(self, audit_env):
+        # Находка создана при недоступном LLM (без вердикта) — на следующем
+        # прогоне с рабочим аналитиком долечивается, а не остаётся с сырыми фактами
+        import json as _json
+        runner_module, factory = audit_env
+
+        assert len(await _run(runner_module, [StubCheck([_raw()])], analyst=None)) == 1
+        async with factory() as s:
+            row = (await s.execute(select(Finding))).scalar_one()
+        assert 'llm' not in _json.loads(row.payload)
+
+        analyst = StubAnalyst('problem')
+        assert await _run(runner_module, [StubCheck([_raw()])], analyst) == []
+        assert analyst.calls == 1   # застрявшую находку переанализировали
+        async with factory() as s:
+            row = (await s.execute(select(Finding))).scalar_one()
+        assert _json.loads(row.payload)['llm']['explanation'] == 'тестовое объяснение'
+
+    async def test_missing_llm_ok_verdict_leaves_queue(self, audit_env):
+        # Долечили и LLM теперь счёл нормой — находка уходит из очереди (ignored)
+        runner_module, factory = audit_env
+        await _run(runner_module, [StubCheck([_raw()])], analyst=None)
+        await _run(runner_module, [StubCheck([_raw()])], StubAnalyst('ok'))
+        async with factory() as s:
+            row = (await s.execute(select(Finding))).scalar_one()
+        assert row.status == FindingStatus.IGNORED
+
 
 class TestRunnerLifecycle:
     async def test_resolved_when_vanished_on_full_scan(self, audit_env):

@@ -6,6 +6,7 @@
 """
 
 import json
+from html import escape
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -66,10 +67,13 @@ def format_finding(finding: Finding) -> str:
         if llm.get('verdict') == 'unclear':
             body += '\n\n❓ <i>Аналитик не уверен — нужно твоё решение.</i>'
         return header + body
-    # Фолбэк без LLM: сырые факты
-    facts = json.dumps({k: v for k, v in payload.items() if k != 'llm'},
-                       ensure_ascii=False, indent=1, default=str)
-    return header + f'<pre>{facts[:800]}</pre>'
+    # Фолбэк без вердикта LLM (аналитик был недоступен при создании находки):
+    # человеческое объяснение проверки, а не сырой JSON.
+    from services.audit.checks import registry_by_id
+    check = registry_by_id().get(finding.check_id)
+    if check is not None:
+        return header + check.explain(payload)
+    return header + escape(finding.title or 'Требуется проверка вручную.')
 
 
 class AuditNotifier:
