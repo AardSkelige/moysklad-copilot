@@ -1,66 +1,89 @@
 # moysklad-copilot
 
-A Telegram bot — corporate assistant on top of [MoySklad](https://www.moysklad.ru) (Russian ERP) for a small manufacturing company. It automates financial accounting, continuously audits inventory and money documents with an LLM, and manages production tasks by voice.
+Телеграм-бот — рабочий помощник для небольшого производственного бизнеса. Владелец компании общается с ботом в чате: бот ведёт деньги, сам находит ошибки в учёте и предлагает их исправить, а производственные задания можно ставить голосом.
 
-Running in production: the sole operator is the company owner — the bot replaces his manual reviews of records kept by several employees working under a single MoySklad account.
+Работает в реальном бизнесе. Раньше владельцу приходилось вручную перепроверять записи, которые вносили несколько сотрудников — теперь эту рутину делает бот и показывает только то, что требует внимания.
 
-## Modules
+## Что делает
 
-### 💰 Finance
-- Create incoming/outgoing payments and cash orders directly in MoySklad (no local copy — a single source of truth)
-- Operation categories mapped to MoySklad expense items, one-way synchronization
-- Excel export of operations for any period
+- **Ведёт деньги.** Приходы, расходы и кассовые операции создаются прямо в учётной системе через чат, с выгрузкой в Excel за любой период.
+- **Сам проверяет учёт.** Круглые сутки просматривает документы склада и денег и находит проблемы: задвоенные платежи, нулевые цены, расхождения в себестоимости, задним числом исправленные документы, отрицательные остатки и другое.
+- **Объясняет и помогает исправить.** По каждой найденной проблеме можно поговорить с ботом в чате: он посмотрит документы и историю изменений и подготовит исправление — кнопкой в один клик.
+- **Наводит порядок в комментариях.** Приводит подписи к документам к единому виду, исправляет опечатки и подсказывает, кто из сотрудников автор записи.
+- **Принимает задания голосом.** «Сделать 40 шампуней», «305-й в готовые» — бот распознаёт голосовое сообщение и создаёт или обновляет производственное задание.
 
-### 🔍 Accounting audit
-Two-layer architecture: **deterministic detectors + an LLM analyst**.
+## Почему это интересно
 
-- 17 checks collect signals with facts from the API: duplicate payments, zero prices in receipts, stock-adjustment deviations from FIFO cost, late edits of posted documents, stale drafts, negative stock, counterparty balances (settlements are computed manually — the pricing plan lacks the report), order/receipt mismatches, and more.
-- The LLM issues a verdict on every signal — "problem / normal / ask a human" — with an explanation and fix options. The code never decides nuanced cases on its own.
-- A conversational agent per finding: the owner discusses the problem, the agent inspects documents and change history through tools and prepares a fix — applied only after an explicit confirmation button.
-- Incremental scheduled runs plus a full nightly scan (APScheduler).
+Главная идея — заставить искусственный интеллект работать надёжно, а не «на удачу».
 
-### 📝 Comment review
-The LLM normalizes document comments to the corporate standard ("Name: what was done, trailing period"), fixes typos using a domain dictionary, and infers the likely author from areas of responsibility. The owner gets "current / proposed" cards with buttons; the edit is written to MoySklad immediately. Separate prompts for shipments (carrying facts over to the linked order) and financial documents (payment purpose + comment).
+Обычная проблема с нейросетями в том, что они уверенно выдумывают. Здесь этого нет: сначала обычный проверенный код собирает из учётной системы только факты и цифры, и лишь потом нейросеть выносит вердикт — «это ошибка», «всё в порядке» или «нужно спросить человека» — опираясь именно на эти факты, а не на догадки. Судит по проверенным данным, а не сочиняет.
 
-### 🏭 Production
-The agent creates and edits production tasks by voice (Groq Whisper) or text: "make 40 shampoos", "move 305 to done". An LLM ↔ tools loop with a preview and confirmation before any write.
+И второе: бот ничего не меняет в учёте самостоятельно. Любое исправление он только предлагает — окончательное решение и нажатие кнопки всегда за человеком. Ошибиться «за спиной» владельца бот не может.
 
-## Architecture
+## Как это выглядит
+
+### Аудит учёта
+
+https://github.com/user-attachments/assets/cdcccfaf-2b2f-44ef-9966-ad998a89fc35
+
+_Бот сам находит ошибку в документах, объясняет её простыми словами и предлагает исправить в один клик._
+
+### Финансы
+
+https://github.com/user-attachments/assets/57cc8e02-9863-45b6-a579-d65a0c4f1231
+
+_Создание платежа в учётной системе прямо из диалога в чате._
+
+### Производство
+
+https://github.com/user-attachments/assets/82dec0d5-ceb6-44cb-a563-24ff94d5d7bb
+
+_Текстовый запрос: бот отвечает, что было произведено за вчера._
+
+https://github.com/user-attachments/assets/7574fda5-820c-4123-b9fc-2cb7baed944a
+
+_Голосовое сообщение: бот распознаёт речь и создаёт производственное задание._
+
+## Архитектура
 
 ```
-core/           config (.env), DB models, logger
-handlers/       aiogram routers: finance / audit / production
-services/       business logic; audit/checks/ — detectors, analyst — the LLM layer
-integrations/   MoySklad API clients (base + domain-specific), Excel
-shared/         keyboards, FSM states, constants, session_scope
+core/           конфиг (.env), модели БД, логгер
+handlers/       роутеры aiogram: finance / audit / production
+services/       бизнес-логика; audit/checks/ — детекторы, analyst — слой LLM
+integrations/   клиенты API МойСклад (базовый + доменные), Excel
+shared/         клавиатуры, состояния FSM, константы, session_scope
 ```
 
-Key decisions:
+Ключевые решения:
 
-- **Engine vs knowledge.** Prompt code lives in the repository; company-specific context (team, domain dictionary, routing rules) lives in `services/audit/team_context_local.py` outside git. The repository ships anonymized example values, and the bot is fully functional without the local file.
-- **The LLM proposes — a human confirms.** Not a single write to MoySklad happens without an explicit button press by the owner.
-- **Money is whole kopecks only** (INTEGER); rubles exist only at the display layer.
-- **Operations live in MoySklad**; the local SQLite stores nothing but the category reference.
+- **Движок отдельно от знаний.** Код промптов лежит в репозитории; специфичный для компании контекст (команда, доменный словарь, правила маршрутизации) вынесен в `services/audit/team_context_local.py` вне git. В репозитории — анонимизированные примеры значений, и бот полностью работоспособен без локального файла.
+- **LLM предлагает — человек подтверждает.** Ни одна запись в МойСклад не происходит без явного нажатия кнопки владельцем.
+- **Деньги — только целые копейки** (INTEGER); рубли существуют лишь на слое отображения.
+- **Операции живут в МойСклад**; локальная SQLite хранит только справочник категорий.
 
-## Stack
+## Стек
 
-Python 3.12 · aiogram 3 · SQLAlchemy 2 (async SQLite) · aiohttp · APScheduler · DeepSeek API (OpenAI-compatible client) · Groq Whisper · openpyxl · Docker
+Python 3.12 · aiogram 3 · SQLAlchemy 2 (async SQLite) · aiohttp · APScheduler · DeepSeek API (OpenAI-совместимый клиент) · Groq Whisper · openpyxl · Docker
 
-## Running
+## Запуск
 
 ```bash
-cp .env.example .env          # fill in tokens and IDs
+cp .env.example .env          # заполнить токены и ID
 pip install -r requirements.txt
-python main.py                # the DB schema is created automatically
+python main.py                # схема БД создаётся автоматически
 ```
 
-Docker: `docker compose up -d`. Server deploy: `./deploy.sh` (address in `DEPLOY_SERVER`).
+Docker: `docker compose up -d`. Деплой на сервер: `./deploy.sh` (адрес в `DEPLOY_SERVER`).
 
-## Tests
+## Тесты
 
 ```bash
-pytest tests/unit/ -v          # 177 tests
-pytest tests/unit/ -m audit    # by marker: fsm, finance, validation, access, audit
+pytest tests/unit/ -v          # 177 тестов
+pytest tests/unit/ -m audit    # по маркеру: fsm, finance, validation, access, audit
 ```
 
-FSM workflows, audit detectors on canned API responses, comment review with a fake LLM, amount parsing, access middleware.
+FSM-сценарии, детекторы аудита на заготовленных ответах API, comment review с фейковым LLM, парсинг сумм, middleware доступа.
+
+---
+
+Автор и единственный разработчик — Sergey Senkin.
