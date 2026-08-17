@@ -295,14 +295,34 @@ class TestDemandZero:
         ctx = FakeContext(FakeClient({'demand': [demand]}))
         assert await DemandZeroCheck().detect(ctx, None) == []
 
+    async def test_named_reason_silences(self):
+        # Живые формулировки: подарок, призы, спонсорство, комиссия по договору
+        for comment in ('Лена: трек-номер СДЭК — 102967, подарок.',
+                        'Лена: на призы на ЧР-2026 по конкуру.',
+                        'Лена: спонсорство, пакеты, открытки.',
+                        'Лена: скидка 30%, комиссия такая по договору.'):
+            demand = _doc('demand', 'dz', '00103', '2026-07-20 10:00:00', sum=0,
+                          description=comment)
+            ctx = FakeContext(FakeClient({'demand': [demand]}))
+            assert await DemandZeroCheck().detect(ctx, None) == [], comment
+
+    async def test_reason_in_order_comment_also_silences(self):
+        # По стандарту причина часто живёт в заказе, а не в отгрузке
+        demand = _doc('demand', 'dz2', '00114', '2026-07-27 10:00:00', sum=0,
+                      description='Накладные расходы 0 — самовывоз.',
+                      customerOrder={'name': '00115',
+                                     'description': 'Лена: на призы на ЧР-2026 по конкуру.'})
+        ctx = FakeContext(FakeClient({'demand': [demand]}))
+        assert await DemandZeroCheck().detect(ctx, None) == []
+
     async def test_detects_zero_demand_with_comment_in_payload(self):
+        # Комментарий есть, но причины нулевой суммы в нём нет — разбирает LLM
         demand = _doc('demand', 'd1', '00077', '2026-07-03 10:00:00', sum=0,
-                      description='подарок на выставку')
+                      description='Лена: трек-номер СДЭК — 10289519381.')
         ctx = FakeContext(FakeClient({'demand': [demand]}))
         found = await DemandZeroCheck().detect(ctx, None)
         assert len(found) == 1
-        # комментарий уходит в payload — вердикт «подарок или ошибка» выносит LLM
-        assert found[0].payload['description'] == 'подарок на выставку'
+        assert found[0].payload['description'] == 'Лена: трек-номер СДЭК — 10289519381.'
 
     async def test_nonzero_demand_ignored(self):
         demand = _doc('demand', 'd2', '00078', '2026-07-03 10:00:00', sum=150000)
@@ -313,11 +333,11 @@ class TestDemandZero:
         # По стандарту причина нулевой суммы живёт в комментарии связанного заказа
         demand = _doc('demand', 'd3', '00019', '2026-05-01 10:00:00', sum=0,
                       customerOrder={'id': 'o1', 'name': '00017',
-                                     'description': 'Ира: самовывоз. Подарок.'})
+                                     'description': 'Ира: самовывоз, забрали 01.05.'})
         ctx = FakeContext(FakeClient({'demand': [demand]}))
         found = await DemandZeroCheck().detect(ctx, None)
         assert found[0].payload['customer_order'] == 'Заказ покупателя №00017'
-        assert found[0].payload['order_comment'] == 'Ира: самовывоз. Подарок.'
+        assert found[0].payload['order_comment'] == 'Ира: самовывоз, забрали 01.05.'
 
 
 class TestDemandNoOverhead:

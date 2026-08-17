@@ -16,6 +16,13 @@ from services.audit.context import (
 )
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
+# Причины нулевой суммы отгрузки, которые у команды в ходу: подарки амбассадорам,
+# призы на соревнования, пробники магазинам, комиссия по договору. Всё это пишут
+# словом в комментарии — читать его должен код, а не LLM на каждом прогоне.
+_ZERO_REASON_MARKERS = ('подарок', 'подар', 'на призы', 'приз', 'спонсор', 'на пробу',
+                        'пробник', 'амбассадор', 'реклам', 'комисси', 'бесплатн',
+                        'маркетплейс', 'благотворит')
+
 # «Доставка по отгрузке № 00148», «Приёмка № 00078» — номер документа в назначении платежа
 _DOC_NUMBER_RE = re.compile(r'№\s*0*(\d+)')
 # упоминание другого документа: номер тот же, а платёж не про нашу отгрузку
@@ -68,6 +75,9 @@ class DemandZeroCheck(CheckSpec):
                 # служебный контрагент для внутренних передач — нулевая сумма ожидаема
                 continue
             order = d.get('customerOrder') or {}
+            reason_text = f'{d.get("description") or ""} {order.get("description") or ""}'.lower()
+            if any(m in reason_text for m in _ZERO_REASON_MARKERS):
+                continue   # причина названа в комментарии отгрузки или заказа
             out.append(RawFinding(
                 entity_type='demand',
                 entity_id=d['id'],
