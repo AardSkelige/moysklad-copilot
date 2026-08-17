@@ -19,7 +19,12 @@ _STOCK_ENTITIES = {
 # связи разворачиваем только там, где они есть у сущности (иначе API отвечает 412)
 _LINK_EXPAND = {'supply': 'purchaseOrder,payments'}
 
-_MAX_AUDIT_DIFFS = 40   # лимит запросов diff за прогон — бережём лимиты API
+# Лимит запросов истории за прогон. Держать его низким выходит дороже, чем кажется:
+# без истории документ нельзя отсеять как «правили только комментарий», и он уходит
+# к LLM пустой карточкой «что менялось, не видно». Запрос к audit API дешевле и
+# быстрее вызова LLM, поэтому потолок высокий (замер: 400 запросов ≈ 60 с,
+# находок при этом 65 → 14).
+_MAX_AUDIT_DIFFS = 300
 
 # правки этих полей не трогают остатки и себестоимость: переписанный комментарий
 # в проведённой приёмке — не то, ради чего будят владельца
@@ -37,10 +42,37 @@ def events_after(events: list[dict], after: str | None) -> list[dict]:
             if not ((ev.get('moment') or '')[:16] and (ev.get('moment') or '')[:16] <= after[:16])]
 
 
+def position_changed(change: dict) -> bool:
+    """Позиция действительно изменилась.
+
+    МойСклад пишет позицию в diff и когда её просто перезаписали теми же
+    значениями («БТМС 6000 г по 1,39 ₽ → БТМС 6000 г по 1,39 ₽») — на остатки
+    и FIFO это не влияет, но выглядит как правка состава."""
+    old, new = change.get('oldValue'), change.get('newValue')
+    if not (isinstance(old, dict) and isinstance(new, dict)):
+        return True   # позицию добавили или удалили
+    same_product = ((old.get('assortment') or {}).get('name')
+                    == (new.get('assortment') or {}).get('name'))
+    return not (same_product
+                and all(old.get(k) == new.get(k) for k in ('quantity', 'price', 'uom')))
+
+
+def meaningful_fields(diff: dict) -> set[str]:
+    """Поля события, которые реально изменились."""
+    out = set()
+    for field, change in (diff or {}).items():
+        if field == 'positions' and isinstance(change, list):
+            if any(position_changed(c) for c in change if isinstance(c, dict)):
+                out.add(field)
+        else:
+            out.add(field)
+    return out
+
+
 def is_cosmetic(events: list[dict]) -> bool:
     """Все правки — только комментарий/номер, на учёт не влияют."""
     return bool(events) and all(
-        set((ev.get('diff') or {})) <= _COSMETIC_FIELDS for ev in events)
+        meaningful_fields(ev.get('diff') or {}) <= _COSMETIC_FIELDS for ev in events)
 
 
 def _position_line(change: dict) -> str:
@@ -81,9 +113,13 @@ def _slim_audit_events(events: list[dict], limit: int = 5,
         slim_diff = {}
         for field, change in list(diff.items())[:6]:
             if isinstance(change, list):
-                # positions приходит списком изменений — раскрываем, что за товар
-                slim_diff[field] = [_position_line(c) if isinstance(c, dict) else str(c)[:120]
-                                    for c in change[:8]]
+                # positions приходит списком изменений — раскрываем, что за товар,
+                # и выбрасываем перезаписи теми же значениями
+                lines = [_position_line(c) for c in change
+                         if isinstance(c, dict) and position_changed(c)]
+                if not lines:
+                    continue
+                slim_diff[field] = lines[:8]
             elif isinstance(change, dict):
                 old = change.get('oldValue')
                 new = change.get('newValue')

@@ -12,7 +12,7 @@ from services.audit.context import AuditContext, format_moment, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 _DONE_STATES = {'готово'}
-_MAX_AUDIT_DIFFS = 30
+_MAX_AUDIT_DIFFS = 300   # см. комментарий в cross.py: без истории отсев косметики не работает
 
 
 class ProductionRetroEditCheck(CheckSpec):

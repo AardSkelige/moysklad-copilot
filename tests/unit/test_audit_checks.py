@@ -501,6 +501,19 @@ class TestRetroEdit:
         ctx = FakeContext(FakeClient({'enter': [supply]}, audit_events=events))
         assert await RetroEditCheck().detect(ctx, None) == []
 
+    async def test_position_rewritten_with_same_values_is_cosmetic(self):
+        # МойСклад пишет позицию в diff и когда её перезаписали теми же значениями:
+        # состав не менялся, FIFO не двигался — будить владельца незачем
+        same = {'assortment': {'name': 'БТМС (BTMS) 80%'},
+                'quantity': 6000.0, 'uom': 'г', 'price': 1.39}
+        supply = _doc('supply', 'e11', '00051', '2026-06-21 13:00:00',
+                      updated='2026-07-05 22:26:00', created='2026-06-21 13:07:00')
+        events = [{'moment': '2026-07-05 22:26:00', 'eventType': 'update', 'uid': 'admin@x',
+                   'diff': {'description': {'oldValue': 'Яна приняла', 'newValue': 'Яна: приняла.'},
+                            'positions': [{'oldValue': same, 'newValue': dict(same)}]}}]
+        ctx = FakeContext(FakeClient({'supply': [supply]}, audit_events=events))
+        assert await RetroEditCheck().detect(ctx, None) == []
+
     async def test_position_change_is_readable_and_flagged(self):
         supply = _doc('enter', 'e10', '00033', '2026-08-05 14:25:00',
                       updated='2026-08-07 09:48:00', created='2026-08-05 14:25:00')
