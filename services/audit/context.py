@@ -72,6 +72,13 @@ def is_marketplace(agent_name: str | None) -> bool:
         m.lower() in agent_name.lower() for m in MARKETPLACE_AGENTS)
 
 
+def is_consolidated_carrier(delivery: str | None) -> bool:
+    """Перевозчик выставляет сводный счёт за период — парного платежа не ищем."""
+    from services.audit.team_context import CONSOLIDATED_CARRIERS
+    return bool(delivery) and any(
+        c.lower() in delivery.lower() for c in CONSOLIDATED_CARRIERS)
+
+
 def delivery_method(doc: dict) -> str | None:
     """Значение доп. поля «Способ доставки» документа (None, если не заполнено)."""
     for a in (doc.get('attributes') or []):

@@ -1,5 +1,6 @@
 """Проверки раздела «Продажи»: отгрузки с нулевой суммой."""
 
+import re
 from datetime import datetime, timedelta
 
 from core import config
@@ -7,10 +8,33 @@ from services.audit.context import (
     AuditContext,
     delivery_method,
     format_moment,
+    is_consolidated_carrier,
     is_marketplace,
     parse_moment,
 )
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
+
+# «Доставка по отгрузке № 00148», «Приёмка № 00078» — номер документа в назначении платежа
+_DOC_NUMBER_RE = re.compile(r'№\s*0*(\d+)')
+# упоминание другого документа: номер тот же, а платёж не про нашу отгрузку
+_OTHER_DOC_WORDS = ('приёмк', 'приемк', 'заказ поставщику', 'счёт поставщика', 'оприходован')
+
+
+def _payment_text(payment: dict) -> str:
+    return f'{payment.get("paymentPurpose") or ""} {payment.get("description") or ""}'
+
+
+def mentions_document(text: str, doc_number: str) -> bool:
+    """Платёж ссылается на документ его номером — так связь оформлена по стандарту.
+
+    Привязка платежа за доставку к отгрузке ломает баланс контрагента, поэтому
+    единственная законная связь — текстовая, и искать её надо в назначении."""
+    if not text.strip() or not doc_number:
+        return False
+    if any(w in text.lower() for w in _OTHER_DOC_WORDS):
+        return False
+    target = doc_number.lstrip('0')
+    return any(n == target for n in _DOC_NUMBER_RE.findall(text))
 
 
 class DemandZeroCheck(CheckSpec):
@@ -148,8 +172,10 @@ class DemandOverheadPaymentCheck(CheckSpec):
     документов» и БЕЗ привязки к отгрузке/заказу (привязка ломает баланс
     контрагента — это не деньги за товар); связь — по сумме и комментарию.
 
-    Исключение — СДЭК: выставляет сводный счёт за период, парного платежа
-    на сумму конкретной отгрузки не бывает, такие отгрузки не сигналим."""
+    Исключение — перевозчики со сводным счётом за период (СДЭК, Яндекс, Озон):
+    платежа на сумму конкретной отгрузки у них не бывает, такие отгрузки не сигналим.
+    Связь платежа с документом ищем и по номеру в назначении: суммы расходятся,
+    когда счёт перевозчика отличается от накладных расходов в отгрузке."""
 
     id = 'demand_overhead_payment'
     section = Section.SALES
@@ -183,8 +209,8 @@ class DemandOverheadPaymentCheck(CheckSpec):
             if overhead <= 0:
                 continue
             delivery = delivery_method(d)
-            if delivery and 'сдэк' in delivery.lower():
-                # СДЭК выставляет сводный счёт — парного платежа не бывает
+            if is_consolidated_carrier(delivery):
+                # сводный счёт за период — платежа под конкретную отгрузку не бывает
                 continue
             try:
                 d_moment = parse_moment(d['moment'])
@@ -195,7 +221,11 @@ class DemandOverheadPaymentCheck(CheckSpec):
                 continue
             matched = None
             for p in payments:
-                if p.get('sum', 0) != overhead:
+                # пара — либо совпадение суммы, либо прямая ссылка на документ
+                # в назначении платежа («Доставка по отгрузке № 00148»):
+                # стоимость доставки в отгрузке и в счёте перевозчика часто расходятся
+                if (p.get('sum', 0) != overhead
+                        and not mentions_document(_payment_text(p), d.get('name', ''))):
                     continue
                 try:
                     gap = abs((parse_moment(p['moment']) - d_moment).days)
@@ -224,9 +254,13 @@ class DemandOverheadPaymentCheck(CheckSpec):
                              + (f' (способ доставки: {delivery})' if delivery else '')
                              + f', но исходящего платежа/РКО на эту сумму '
                              f'(±{self._MATCH_WINDOW_DAYS} дн.) не найдено.'),
-                    'fix_hint': ('Стандарт: платёж за доставку — ОТДЕЛЬНЫЙ исходящий '
+                    'fix_hint': ('Сами накладные расходы отгрузки в баланс контрагента '
+                                 'НЕ входят: они распределяются на себестоимость позиций. '
+                                 'Риск другой — расход на доставку не проведён в Деньгах, '
+                                 'поэтому прибыль завышена. '
+                                 'Стандарт: платёж за доставку — ОТДЕЛЬНЫЙ исходящий '
                                  'платёж или РКО с галкой «Без закрывающих документов», '
-                                 'БЕЗ привязки к отгрузке или заказу (привязка сломает '
+                                 'БЕЗ привязки к отгрузке или заказу (привязка сломала бы '
                                  'баланс контрагента — это не деньги за товар). '
                                  'Если оплата была — создать такой платёж на перевозчика '
                                  '(create_payment, статья расходов «Логистика»), связь '

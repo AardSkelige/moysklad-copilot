@@ -408,17 +408,18 @@ class TestDemandOverheadPayment:
         assert await DemandOverheadPaymentCheck().detect(ctx, None) == []
 
     async def test_other_delivery_method_flagged_with_payload(self):
-        # Живой кейс №00086 (Озон ПВЗ): накладные 1638 ₽ без парного платежа
+        # Живой кейс №00148 (ТК Байкал): накладные 8 434,29 ₽ без парного платежа.
+        # Перевозчик выставляет счёт под конкретную перевозку — платёж обязан быть
         from services.audit.checks.sales import DemandOverheadPaymentCheck
-        demand = _doc('demand', 'd7', '00086', '2026-05-12 10:00:00', sum=500000,
-                      overhead={'sum': 163800},
+        demand = _doc('demand', 'd7', '00148', '2026-08-07 15:00:00', sum=8847000,
+                      overhead={'sum': 843429},
                       attributes=[{'name': 'Способ доставки',
-                                   'value': {'name': 'Озон (ПВЗ)'}}])
+                                   'value': {'name': 'ТК Байкал'}}])
         ctx = FakeContext(FakeClient({'demand': [demand], 'paymentout': [],
                                       'cashout': []}))
         found = await DemandOverheadPaymentCheck().detect(ctx, None)
         assert len(found) == 1
-        assert found[0].payload['delivery_method'] == 'Озон (ПВЗ)'
+        assert found[0].payload['delivery_method'] == 'ТК Байкал'
         assert 'БЕЗ привязки' in found[0].payload['fix_hint']
         assert 'create_payment' in found[0].payload['fix_hint']
 
@@ -527,6 +528,59 @@ class TestRetroEdit:
         supply['updated'] = '2026-06-20 15:00:00'
         fp2 = fingerprint(check.id, (await check.detect(ctx, None))[0])
         assert fp1 != fp2
+
+
+class TestOverheadPaymentMatching:
+    def _demand(self, name, moment, overhead):
+        return _doc('demand', f'd{name}', name, moment, sum=8847000,
+                    overhead={'sum': overhead, 'distribution': 'price'},
+                    agent={'name': 'КСЦ ПРИМЕР',
+                           'meta': {'href': f'{MS}/entity/counterparty/c1'}})
+
+    def _payment(self, name, moment, total, purpose=''):
+        return _doc('paymentout', f'p{name}', name, moment, sum=total,
+                    paymentPurpose=purpose)
+
+    async def test_matched_by_document_number_in_purpose(self):
+        # Стандарт аккаунта: связь платежа с документом — текстом в назначении.
+        # Сумма счёта перевозчика отличается от накладных расходов — это не повод сигналить
+        from services.audit.checks.sales import DemandOverheadPaymentCheck
+        data = {
+            'demand': [self._demand('00148', '2026-08-07 15:00:00', 843429)],
+            'paymentout': [self._payment('00120', '2026-08-09 10:00:00', 800000,
+                                         'Доставка по отгрузке № 00148')],
+        }
+        ctx = FakeContext(FakeClient(data))
+        assert await DemandOverheadPaymentCheck().detect(ctx, None) == []
+
+    async def test_same_number_but_other_document_type_not_matched(self):
+        # «Приёмка № 00148» — тот же номер, но платёж не про нашу отгрузку
+        from services.audit.checks.sales import DemandOverheadPaymentCheck
+        data = {
+            'demand': [self._demand('00148', '2026-08-07 15:00:00', 843429)],
+            'paymentout': [self._payment('00120', '2026-08-09 10:00:00', 800000,
+                                         'Доставка по приёмке № 00148')],
+        }
+        ctx = FakeContext(FakeClient(data))
+        found = await DemandOverheadPaymentCheck().detect(ctx, None)
+        assert len(found) == 1
+
+    async def test_yandex_pvz_is_consolidated_carrier(self):
+        # Яндекс/Озон ПВЗ, как и СДЭК, выставляют сводный счёт за период
+        from services.audit.checks.sales import DemandOverheadPaymentCheck
+        demand = self._demand('00082', '2026-07-07 15:00:00', 48922)
+        demand['attributes'] = [{'name': 'Способ доставки', 'value': {'name': 'Яндекс (ПВЗ)'}}]
+        ctx = FakeContext(FakeClient({'demand': [demand]}))
+        assert await DemandOverheadPaymentCheck().detect(ctx, None) == []
+
+    async def test_still_matched_by_equal_sum(self):
+        from services.audit.checks.sales import DemandOverheadPaymentCheck
+        data = {
+            'demand': [self._demand('00150', '2026-08-07 15:00:00', 843429)],
+            'paymentout': [self._payment('00121', '2026-08-08 10:00:00', 843429)],
+        }
+        ctx = FakeContext(FakeClient(data))
+        assert await DemandOverheadPaymentCheck().detect(ctx, None) == []
 
 
 class TestCounterpartyBalance:
