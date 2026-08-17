@@ -12,6 +12,33 @@ from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 _DEVIATION_CRITICAL = 0.50    # >50% — похоже на ошибку единиц измерения (кг вместо г и т.п.)
 _DEVIATION_IMPORTANT = 0.15   # 15–50% — рост цены/накладные, стоит взглянуть
 
+# Маркеры бесплатного поступления в комментарии документа-источника: этикетки от
+# типографии, образцы от технолога, упаковка «взял в ХБ». Для них ноль — норма,
+# и решать это должен код: гонять LLM ради чтения слова «бесплатно» незачем.
+_FREE_MARKERS = ('бесплатн', 'на пробу', 'подарок', 'подарен', 'по нулевым',
+                 'нулевая стоимость', 'нулевой суммы', 'даром', 'отдали', 'отдал')
+
+
+def _previously_priced(sources: list[dict]) -> dict | None:
+    """Самое свежее поступление товара с НЕнулевой ценой.
+
+    Решающий факт: если такие же этикетки покупали по 36 ₽, «они бесплатные»
+    больше не объяснение — либо цену забыли, либо в этот раз действительно отдали
+    даром и это надо написать. Источники собраны по возрастанию даты."""
+    priced = [s for s in sources if (s.get('price_kopecks') or 0) > 0]
+    return priced[-1] if priced else None
+
+
+def _explained_as_free(payload_docs: list[dict], last_supply: dict | None) -> bool:
+    """Все документы-источники объясняют ноль бесплатным поступлением."""
+    comments = [(d.get('comment') or '') for d in payload_docs]
+    if last_supply:
+        comments.append(last_supply.get('comment') or '')
+    comments = [c for c in comments if c.strip()]
+    if not comments:
+        return False
+    return all(any(m in c.lower() for m in _FREE_MARKERS) for c in comments)
+
 
 def _uom(row: dict) -> str:
     """Единица измерения товара из отчёта остатков: сырьё бывает в г, мл, л, шт —
@@ -116,6 +143,8 @@ class FifoZeroCheck(CheckSpec):
             if r.get('stock', 0) <= 0 or r.get('price', 0) != 0:
                 continue
             href = r.get('meta', {}).get('href', '').split('?')[0]
+            if _explained_as_free(sources.get(href, []), last.get(href)):
+                continue   # «получено бесплатно» написано в документе — ноль корректен
             out.append(RawFinding(
                 entity_type='product',
                 entity_id=href.split('/')[-1],
@@ -129,11 +158,16 @@ class FifoZeroCheck(CheckSpec):
                     'uom': _uom(r),
                     'fifo_kopecks': 0,
                     'last_supply': last.get(href),
+                    'previously_priced': _previously_priced(sources.get(href, [])),
                     'source_documents': sources.get(href, [])[:6],
                     'note': ('Нулевая себестоимость занижает FIFO готовой продукции, '
                              'в которую входит этот товар. ЧИТАЙ комментарии '
                              'документов-источников: «отдали бесплатно», «подарок» '
-                             'и т.п. делают ноль нормой для любого товара.'),
+                             'и т.п. делают ноль нормой для любого товара. '
+                             'Поле previously_priced — поступление ЭТОГО ЖЕ товара '
+                             'с ненулевой ценой: если оно заполнено, товар покупали '
+                             'за деньги, и ноль требует объяснения в комментарии; '
+                             'если пусто — товар никогда не стоил денег.'),
                 },
                 fingerprint_salt='',
                 ui_link=ui_links.get(href, ''),

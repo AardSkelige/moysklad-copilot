@@ -853,6 +853,51 @@ class TestFifoChecks:
         assert len(found) == 1
         assert found[0].payload['stock'] == 120
 
+    async def test_free_marker_in_comment_silences(self):
+        # Живой кейс: «Этикетки получены бесплатно — себестоимость 0 корректна».
+        # Читать такой комментарий должен код, а не LLM на каждом прогоне
+        from services.audit.checks.products import FifoZeroCheck
+        supply = _doc('supply', 's1', '00071', '2026-07-29 10:00:00',
+                      description='Яна: приняла на склад. Этикетки получены бесплатно.',
+                      positions={'rows': [
+                          {'price': 0, 'quantity': 63,
+                           'assortment': _product_meta('p1', 'Этикетка | Пенка 200 мл')}]})
+        client = FakeClient({'supply': [supply]},
+                            stock=[self._stock_row('p1', 'Этикетка | Пенка 200 мл', 0, 58)])
+        assert await FifoZeroCheck().detect(FakeContext(client), None) == []
+
+    async def test_previously_priced_in_payload(self):
+        # Те же этикетки когда-то покупали по 36,16 ₽ — аналитик должен это видеть
+        from services.audit.checks.products import FifoZeroCheck
+        paid = _doc('supply', 's3', '00024', '2026-04-01 10:00:00',
+                    description='Яна: приняла на склад производства.',
+                    positions={'rows': [
+                        {'price': 3616, 'quantity': 700,
+                         'assortment': _product_meta('p3', 'Этикетка | Шампунь 500 мл')}]})
+        free = _doc('supply', 's4', '00060', '2026-07-07 10:00:00',
+                    description='Яна: приняла на склад производства.',
+                    positions={'rows': [
+                        {'price': 0, 'quantity': 100,
+                         'assortment': _product_meta('p3', 'Этикетка | Шампунь 500 мл')}]})
+        client = FakeClient({'supply': [paid, free]},
+                            stock=[self._stock_row('p3', 'Этикетка | Шампунь 500 мл', 0, 696)])
+        found = await FifoZeroCheck().detect(FakeContext(client), None)
+        assert len(found) == 1
+        assert found[0].payload['previously_priced']['price_kopecks'] == 3616
+
+    async def test_zero_without_explanation_still_detected(self):
+        # Тот же ноль, но причины в комментарии нет — сигнал обязан остаться
+        from services.audit.checks.products import FifoZeroCheck
+        supply = _doc('supply', 's2', '00072', '2026-07-29 10:00:00',
+                      description='Яна: приняла на склад производства.',
+                      positions={'rows': [
+                          {'price': 0, 'quantity': 63,
+                           'assortment': _product_meta('p2', 'Ланолин')}]})
+        client = FakeClient({'supply': [supply]},
+                            stock=[self._stock_row('p2', 'Ланолин', 0, 9920)])
+        found = await FifoZeroCheck().detect(FakeContext(client), None)
+        assert len(found) == 1
+
     async def test_fifo_zero_without_stock_silent(self):
         from services.audit.checks.products import FifoZeroCheck
         client = FakeClient({'supply': []},
