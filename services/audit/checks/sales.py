@@ -9,7 +9,9 @@ from services.audit.context import (
     delivery_method,
     format_moment,
     is_consolidated_carrier,
+    is_internal_agent,
     is_marketplace,
+    is_self_delivery,
     parse_moment,
 )
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
@@ -60,6 +62,11 @@ class DemandZeroCheck(CheckSpec):
         for d in docs:
             if d.get('sum', 0) != 0:
                 continue
+            agent_name = ((d.get('agent') or {}).get('name')
+                          if isinstance(d.get('agent'), dict) else None)
+            if is_internal_agent(agent_name):
+                # служебный контрагент для внутренних передач — нулевая сумма ожидаема
+                continue
             order = d.get('customerOrder') or {}
             out.append(RawFinding(
                 entity_type='demand',
@@ -69,8 +76,7 @@ class DemandZeroCheck(CheckSpec):
                 severity=self.default_severity,
                 payload={
                     'moment': (d.get('moment') or '')[:16],
-                    'agent': ((d.get('agent') or {}).get('name')
-                              if isinstance(d.get('agent'), dict) else None),
+                    'agent': agent_name,
                     'description': (d.get('description') or '')[:300],
                     'customer_order': (f'Заказ покупателя №{order["name"]}'
                                        if order.get('name') else None),
@@ -124,6 +130,10 @@ class DemandNoOverheadCheck(CheckSpec):
                 # товар отдают в ПВЗ, дальше везёт маркетплейс — накладных расходов
                 # тут не бывает вовсе, спрашивать про них незачем
                 continue
+            delivery = delivery_method(d)
+            if is_self_delivery(delivery):
+                # самовывоз или везём сами — услуги перевозчика нет, спрашивать нечего
+                continue
             # накладные расходы и комментарий часто вносят на следующий день
             try:
                 if parse_moment(d['moment']) > grace:
@@ -140,6 +150,9 @@ class DemandNoOverheadCheck(CheckSpec):
                 payload={
                     'moment': (d.get('moment') or '')[:16],
                     'agent': agent_name,
+                    # способ доставки из карточки: без него аналитик вычислял его
+                    # из комментария заказа и ошибался
+                    'delivery_method': delivery,
                     'sum_kopecks': d.get('sum', 0),
                     'description': (d.get('description') or '')[:300],
                     'customer_order': (f'Заказ покупателя №{order["name"]}'

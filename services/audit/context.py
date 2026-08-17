@@ -72,6 +72,20 @@ def is_marketplace(agent_name: str | None) -> bool:
         m.lower() in agent_name.lower() for m in MARKETPLACE_AGENTS)
 
 
+def is_self_delivery(delivery: str | None) -> bool:
+    """Самовывоз или доставка своими силами — накладных расходов не бывает."""
+    from services.audit.team_context import SELF_DELIVERY_METHODS
+    return bool(delivery) and any(
+        m.lower() in delivery.lower() for m in SELF_DELIVERY_METHODS)
+
+
+def is_internal_agent(agent_name: str | None) -> bool:
+    """Служебный контрагент для внутренних передач (нулевые суммы там ожидаемы)."""
+    from services.audit.team_context import INTERNAL_AGENTS
+    return bool(agent_name) and any(
+        a.lower() in agent_name.lower() for a in INTERNAL_AGENTS)
+
+
 def is_consolidated_carrier(delivery: str | None) -> bool:
     """Перевозчик выставляет сводный счёт за период — парного платежа не ищем."""
     from services.audit.team_context import CONSOLIDATED_CARRIERS

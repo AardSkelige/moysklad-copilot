@@ -33,14 +33,21 @@ def _facts_changed(stored: dict, fresh: dict) -> bool:
 
 
 class AuditRunner:
+    # переанализ старых находок за один прогон: после правки детекторов факты
+    # меняются разом у сотен записей, и без потолка прогон превращается в шторм
+    # запросов к LLM. Остальные долечиваются на следующих прогонах.
+    _MAX_RETRIAGE_PER_RUN = 25
+
     def __init__(self, checks: list[CheckSpec], analyst: AuditAnalyst | None = None):
         self.checks = checks
         self.analyst = analyst
+        self._retriage_budget = self._MAX_RETRIAGE_PER_RUN
 
     async def run(self, run_type: str) -> list[Finding]:
         """Выполнить прогон. Возвращает новые findings со статусом NEW (для уведомлений)."""
         started = datetime.now()
         client = MoySkladAuditClient()
+        self._retriage_budget = self._MAX_RETRIAGE_PER_RUN
 
         async with session_scope() as db:
             is_baseline = (await db.execute(select(AuditRun.id).limit(1))).first() is None
@@ -131,9 +138,13 @@ class AuditRunner:
                 # проверки или сами детекторы стали давать больше данных. Вердикт LLM
                 # опирался на старые факты, значит устарел: обновляем и переанализируем
                 if _facts_changed(stored, raw.payload):
-                    stored.update({k: v for k, v in raw.payload.items() if v is not None})
-                    retriage_id = existing.id
-                    changed = True
+                    # факты и вердикт обновляем только вместе: иначе на следующем прогоне
+                    # расхождения уже не будет и находка застрянет со старым вердиктом
+                    if self._retriage_budget > 0:
+                        stored.update({k: v for k, v in raw.payload.items() if v is not None})
+                        retriage_id = existing.id
+                        self._retriage_budget -= 1
+                        changed = True
                 # находка застряла без вердикта (LLM был недоступен при создании) —
                 # долечиваем на ближайшем прогоне, иначе владелец видит сырые факты
                 elif 'llm' not in stored and check.llm_triage:

@@ -287,6 +287,14 @@ class TestOrderSupplyMismatch:
 
 
 class TestDemandZero:
+    async def test_internal_agent_silent(self):
+        # Служебный контрагент для внутренних передач — нулевая сумма ожидаема
+        demand = _doc('demand', 'd9', '00176', '2026-08-10 14:46:00', sum=0,
+                      agent={'name': 'StarPony - внутренние операции',
+                             'meta': {'href': f'{MS}/entity/counterparty/int'}})
+        ctx = FakeContext(FakeClient({'demand': [demand]}))
+        assert await DemandZeroCheck().detect(ctx, None) == []
+
     async def test_detects_zero_demand_with_comment_in_payload(self):
         demand = _doc('demand', 'd1', '00077', '2026-07-03 10:00:00', sum=0,
                       description='подарок на выставку')
@@ -330,6 +338,24 @@ class TestDemandNoOverhead:
         ctx = FakeContext(FakeClient({'demand': [demand]}))
         found = await DemandNoOverheadCheck().detect(ctx, None)
         assert found[0].payload['order_comment'] == 'Оля: забирает для себя.'
+
+    async def test_self_delivery_silent(self):
+        # Самовывоз и «Своими силами» — услуги перевозчика нет, накладных не бывает
+        from services.audit.checks.sales import DemandNoOverheadCheck
+        for method in ('Самовывоз', 'Своими силами'):
+            demand = _doc('demand', f'd_{method}', '00122', '2026-07-31 10:00:00', sum=1319500,
+                          attributes=[{'name': 'Способ доставки', 'value': {'name': method}}])
+            ctx = FakeContext(FakeClient({'demand': [demand]}))
+            assert await DemandNoOverheadCheck().detect(ctx, None) == [], method
+
+    async def test_delivery_method_in_payload(self):
+        # Способ доставки берём из карточки, а не заставляем ИИ выводить из комментария
+        from services.audit.checks.sales import DemandNoOverheadCheck
+        demand = _doc('demand', 'd8', '00203', '2026-08-14 12:18:00', sum=4743000,
+                      attributes=[{'name': 'Способ доставки', 'value': {'name': 'Яндекс (ПВЗ)'}}])
+        ctx = FakeContext(FakeClient({'demand': [demand]}))
+        found = await DemandNoOverheadCheck().detect(ctx, None)
+        assert found[0].payload['delivery_method'] == 'Яндекс (ПВЗ)'
 
     async def test_marketplace_demand_silent(self):
         # Озон забирает товар в ПВЗ и везёт сам — накладных расходов не бывает
