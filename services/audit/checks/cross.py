@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 
 from core import config
-from services.audit.context import AuditContext, format_moment, parse_moment
+from services.audit.context import AuditContext, format_moment, linked_documents, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 # Складские документы, где поздняя правка бьёт по остаткам и FIFO прошлых дат.
@@ -16,27 +16,75 @@ _STOCK_ENTITIES = {
     'inventory': 'Инвентаризация',
 }
 
+# связи разворачиваем только там, где они есть у сущности (иначе API отвечает 412)
+_LINK_EXPAND = {'supply': 'purchaseOrder,payments'}
+
 _MAX_AUDIT_DIFFS = 40   # лимит запросов diff за прогон — бережём лимиты API
+
+# правки этих полей не трогают остатки и себестоимость: переписанный комментарий
+# в проведённой приёмке — не то, ради чего будят владельца
+_COSMETIC_FIELDS = {'description', 'name'}
+
+
+def events_after(events: list[dict], after: str | None) -> list[dict]:
+    """События ПОЗЖЕ указанного момента.
+
+    Для ретро-правок интересны изменения после создания документа
+    (или завершения производства), а не вся легитимная история ввода."""
+    if not after:
+        return list(events)
+    return [ev for ev in events
+            if not ((ev.get('moment') or '')[:16] and (ev.get('moment') or '')[:16] <= after[:16])]
+
+
+def is_cosmetic(events: list[dict]) -> bool:
+    """Все правки — только комментарий/номер, на учёт не влияют."""
+    return bool(events) and all(
+        set((ev.get('diff') or {})) <= _COSMETIC_FIELDS for ev in events)
+
+
+def _position_line(change: dict) -> str:
+    """Строка позиции из diff — по-человечески, а не обрезанным JSON.
+
+    Суммы в audit API уже в рублях (в отличие от документов), поэтому не делим."""
+    old, new = change.get('oldValue'), change.get('newValue')
+
+    def num(v) -> str:
+        return f'{v:g}' if isinstance(v, (int, float)) else str(v)
+
+    def descr(v: dict) -> str:
+        name = ((v.get('assortment') or {}).get('name') or '?')
+        price = v.get('price')
+        price_s = f'{price:,.2f}'.replace(',', ' ').replace('.', ',') if isinstance(
+            price, (int, float)) else str(price)
+        return (f'{name} — {num(v.get("quantity"))} {v.get("uom") or ""}'
+                f' по {price_s} ₽').replace('  ', ' ')
+
+    if isinstance(old, dict) and isinstance(new, dict):
+        return f'изменена позиция: {descr(old)} → {descr(new)}'
+    if isinstance(new, dict):
+        return f'добавлена позиция: {descr(new)}'
+    if isinstance(old, dict):
+        return f'удалена позиция: {descr(old)}'
+    return str(change)[:120]
 
 
 def _slim_audit_events(events: list[dict], limit: int = 5,
                        after: str | None = None) -> list[dict]:
-    """Компактный diff событий audit API.
-
-    after — оставить только события ПОЗЖЕ этого момента: для ретро-правок
-    интересны изменения после даты документа/завершения производства,
-    а не вся легитимная история редактирования."""
+    """Компактный diff событий audit API (не более limit штук)."""
     out = []
-    for ev in events:
+    for ev in events_after(events, after):
         if len(out) >= limit:
             break
         moment = (ev.get('moment') or '')[:16]
-        if after and moment and moment <= after[:16]:
-            continue
         diff = ev.get('diff') or {}
         slim_diff = {}
         for field, change in list(diff.items())[:6]:
-            if isinstance(change, dict):
+            if isinstance(change, list):
+                # positions приходит списком изменений — раскрываем, что за товар
+                slim_diff[field] = [_position_line(c) if isinstance(c, dict) else str(c)[:120]
+                                    for c in change[:8]]
+            elif isinstance(change, dict):
                 old = change.get('oldValue')
                 new = change.get('newValue')
                 slim_diff[field] = {
@@ -48,6 +96,7 @@ def _slim_audit_events(events: list[dict], limit: int = 5,
         out.append({
             'moment': moment,
             'type': ev.get('eventType'),
+            'who': ev.get('uid', ''),   # кто правил — иначе LLM гадает по комментарию
             'diff': slim_diff,
         })
     return out
@@ -72,25 +121,37 @@ class RetroEditCheck(CheckSpec):
             docs = await ctx.client.list_entities(
                 ctx.session, entity,
                 filters=f'updated>={window_start}',
+                expand=_LINK_EXPAND.get(entity, ''),
                 order='updated,desc',
             )
             for d in docs:
                 if d.get('applicable') is False:
                     continue
                 try:
-                    gap = parse_moment(d['updated']) - parse_moment(d['moment'])
+                    # точка отсчёта — создание документа, а не его дата: приёмку от 04.08,
+                    # заведённую 07.08, правкой считать нельзя — правок после создания не было
+                    baseline = max(parse_moment(d['moment']),
+                                   parse_moment(d.get('created') or d['moment']))
+                    gap = parse_moment(d['updated']) - baseline
                 except (KeyError, ValueError):
                     continue
                 if gap <= threshold:
                     continue
                 events = []
+                history_checked = False
                 if diffs_budget > 0:
                     try:
-                        events = _slim_audit_events(
+                        # интересуют только ПОЗДНИЕ правки: то, что доделали в первые
+                        # сутки после создания, — обычное дозаполнение документа
+                        raw_events = events_after(
                             await ctx.client.entity_audit_events(ctx.session, entity, d['id']),
-                            after=d.get('moment'),
+                            format_moment(baseline + threshold),
                         )
+                        history_checked = True
                         diffs_budget -= 1
+                        if is_cosmetic(raw_events):
+                            continue   # переписали только комментарий — на учёт не влияет
+                        events = _slim_audit_events(raw_events)
                     except Exception:
                         pass
                 out.append(RawFinding(
@@ -101,10 +162,15 @@ class RetroEditCheck(CheckSpec):
                     severity=self.default_severity,
                     payload={
                         'doc_moment': (d.get('moment') or '')[:16],
+                        'created': (d.get('created') or '')[:16],
                         'updated': (d.get('updated') or '')[:16],
                         'gap_days': round(gap.total_seconds() / 86400, 1),
                         'description': (d.get('description') or '')[:300],
+                        'linked_documents': linked_documents(d),
                         'changes_after_doc_date': events,
+                        # без флага пустая история читается как «правок не было» —
+                        # хотя её могли просто не запросить (лимит запросов за прогон)
+                        'history_checked': history_checked,
                     },
                     fingerprint_salt=d['updated'][:10],   # правка в другой день = новый сигнал
                 ))

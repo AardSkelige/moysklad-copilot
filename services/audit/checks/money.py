@@ -3,7 +3,7 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-from services.audit.context import AuditContext, format_moment, parse_moment
+from services.audit.context import AuditContext, format_moment, is_marketplace, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 _DUPLICATE_WINDOW_DAYS = 14
@@ -220,7 +220,11 @@ class CounterpartyBalanceCheck(CheckSpec):
                          else 'приёмки не оплачены') +
                         f': {abs(supplier_balance) / 100:,.2f} ₽'.replace(',', ' '))
             if s['demands'] or s['paid_in']:
-                if abs(customer_balance) > self._BALANCE_THRESHOLD_KOPECKS:
+                if (customer_balance > 0 and is_marketplace(s['agent'])):
+                    # маркетплейс платит реестром за период: долг по отгрузкам
+                    # выравнивается следующей выплатой — это не потерянные деньги
+                    pass
+                elif abs(customer_balance) > self._BALANCE_THRESHOLD_KOPECKS:
                     problems.append(
                         ('покупатель не доплатил' if customer_balance > 0
                          else 'получено больше, чем отгружено') +

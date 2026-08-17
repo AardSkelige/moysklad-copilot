@@ -20,6 +20,58 @@ def parse_moment(s: str) -> datetime:
     return datetime.strptime(s[:19], '%Y-%m-%d %H:%M:%S')
 
 
+_DOC_LABELS = {
+    'purchaseorder': 'Заказ поставщику',
+    'customerorder': 'Заказ покупателя',
+    'invoicein': 'Счёт поставщика',
+    'invoiceout': 'Счёт покупателю',
+    'paymentin': 'Входящий платёж',
+    'paymentout': 'Исходящий платёж',
+    'cashin': 'Приходный ордер',
+    'cashout': 'Расходный ордер',
+    'supply': 'Приёмка',
+    'demand': 'Отгрузка',
+}
+
+# поля-связи, которые API отдаёт объектом при expand
+_LINK_FIELDS = ('purchaseOrder', 'customerOrder', 'invoiceIn', 'invoiceOut', 'demand', 'supply')
+
+
+def _linked_line(doc: dict) -> str | None:
+    """«Заказ поставщику №00083 от 2026-08-12 на 2 000,00 ₽» из развёрнутой связи."""
+    name = doc.get('name')
+    if not name:
+        return None   # связь пришла голой meta (без expand) — номера нет, показывать нечего
+    label = _DOC_LABELS.get((doc.get('meta') or {}).get('type', ''), 'Документ')
+    total = doc.get('sum')
+    money = f' на {total / 100:,.2f} ₽'.replace(',', ' ').replace('.', ',') if isinstance(
+        total, (int, float)) else ''
+    return f'{label} №{name} от {(doc.get("moment") or "")[:10]}{money}'
+
+
+def linked_documents(doc: dict) -> list[str]:
+    """Связанные документы человекочитаемо — чтобы аналитик не гадал о связях по датам."""
+    out = []
+    for field in _LINK_FIELDS:
+        v = doc.get(field)
+        if isinstance(v, dict) and (line := _linked_line(v)):
+            out.append(line)
+    for v in (doc.get('payments') or []):
+        if isinstance(v, dict) and (line := _linked_line(v)):
+            out.append(line)
+    return out
+
+
+def is_marketplace(agent_name: str | None) -> bool:
+    """Контрагент-маркетплейс: возит товар и рассчитывается по своим правилам.
+
+    Импорт внутри функции — team_context подтягивает локальный override,
+    а он читает переменные окружения при инициализации."""
+    from services.audit.team_context import MARKETPLACE_AGENTS
+    return bool(agent_name) and any(
+        m.lower() in agent_name.lower() for m in MARKETPLACE_AGENTS)
+
+
 def delivery_method(doc: dict) -> str | None:
     """Значение доп. поля «Способ доставки» документа (None, если не заполнено)."""
     for a in (doc.get('attributes') or []):

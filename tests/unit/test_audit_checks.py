@@ -331,6 +331,15 @@ class TestDemandNoOverhead:
         found = await DemandNoOverheadCheck().detect(ctx, None)
         assert found[0].payload['order_comment'] == 'Оля: забирает для себя.'
 
+    async def test_marketplace_demand_silent(self):
+        # Озон забирает товар в ПВЗ и везёт сам — накладных расходов не бывает
+        from services.audit.checks.sales import DemandNoOverheadCheck
+        demand = _doc('demand', 'd5', '00204', '2026-08-16 10:00:00', sum=1000000,
+                      agent={'name': 'ООО "Ozon Маркетплейс"',
+                             'meta': {'href': f'{MS}/entity/counterparty/oz'}})
+        ctx = FakeContext(FakeClient({'demand': [demand]}))
+        assert await DemandNoOverheadCheck().detect(ctx, None) == []
+
     async def test_with_overhead_silent(self):
         from services.audit.checks.sales import DemandNoOverheadCheck
         demand = _doc('demand', 'd2', '00023', '2026-05-12 10:00:00', sum=150000,
@@ -436,6 +445,79 @@ class TestRetroEdit:
         ctx = FakeContext(FakeClient({'supply': [supply]}))
         assert await RetroEditCheck().detect(ctx, None) == []
 
+    async def test_backdated_creation_is_not_an_edit(self):
+        # Живой кейс: приёмка 00081 от 04.08 заведена в МС 07.08 и больше не менялась —
+        # разрыв даёт само оформление постфактум, правки после создания не было
+        supply = _doc('supply', 's4', '00081', '2026-08-04 10:24:00',
+                      updated='2026-08-07 10:24:26', created='2026-08-07 10:24:26',
+                      description='Яна приняла на склад производства')
+        ctx = FakeContext(FakeClient({'supply': [supply]}))
+        assert await RetroEditCheck().detect(ctx, None) == []
+
+    async def test_edit_after_backdated_creation_detected(self):
+        # тот же документ, но потом его действительно правили — сигнал обязан остаться
+        supply = _doc('supply', 's5', '00081', '2026-08-04 10:24:00',
+                      updated='2026-08-15 12:00:00', created='2026-08-07 10:24:26')
+        ctx = FakeContext(FakeClient({'supply': [supply]}))
+        found = await RetroEditCheck().detect(ctx, None)
+        assert len(found) == 1
+        assert found[0].payload['gap_days'] > 8      # считаем от создания, не от даты документа
+        assert found[0].payload['created'] == '2026-08-07 10:24'
+
+    async def test_comment_only_edit_is_not_flagged(self):
+        # Живой кейс: в оприходовании 00032 через сутки переписали только комментарий
+        supply = _doc('enter', 'e9', '00032', '2026-08-05 14:25:00',
+                      updated='2026-08-07 09:48:00', created='2026-08-05 14:25:00')
+        events = [{'moment': '2026-08-07 09:48:57', 'eventType': 'update', 'uid': 'admin@x',
+                   'diff': {'description': {'oldValue': 'заказ 1337055',
+                                            'newValue': 'Лена: заказ 1337055'}}}]
+        ctx = FakeContext(FakeClient({'enter': [supply]}, audit_events=events))
+        assert await RetroEditCheck().detect(ctx, None) == []
+
+    async def test_position_change_is_readable_and_flagged(self):
+        supply = _doc('enter', 'e10', '00033', '2026-08-05 14:25:00',
+                      updated='2026-08-07 09:48:00', created='2026-08-05 14:25:00')
+        events = [{'moment': '2026-08-07 09:48:57', 'eventType': 'update', 'uid': 'admin@x',
+                   'diff': {'sum': {'oldValue': 1192.9, 'newValue': 2885.4},
+                            'positions': [{'newValue': {
+                                'assortment': {'name': 'Короб чёрный'},
+                                'quantity': 25.0, 'uom': 'шт', 'price': 3.6}}]}}]
+        ctx = FakeContext(FakeClient({'enter': [supply]}, audit_events=events))
+        found = await RetroEditCheck().detect(ctx, None)
+        assert len(found) == 1
+        change = found[0].payload['changes_after_doc_date'][0]
+        assert change['who'] == 'admin@x'
+        assert change['diff']['positions'] == ['добавлена позиция: Короб чёрный — 25 шт по 3,60 ₽']
+
+    async def test_edits_within_first_day_are_data_entry(self):
+        # Живой кейс 00085: комментарий дописан через 14 секунд после создания —
+        # это ввод, в историю поздних правок он попадать не должен
+        supply = _doc('supply', 's6', '00085', '2026-08-12 12:32:00',
+                      updated='2026-08-14 14:50:00', created='2026-08-12 12:33:00')
+        events = [
+            {'moment': '2026-08-14 14:50:37', 'eventType': 'update', 'uid': 'admin@x',
+             'diff': {'positions': [{'newValue': {'assortment': {'name': 'Этикетка'},
+                                                  'quantity': 42.0, 'uom': 'шт', 'price': 23.8}}]}},
+            {'moment': '2026-08-12 12:33:53', 'eventType': 'update', 'uid': 'admin@x',
+             'diff': {'description': {'oldValue': '', 'newValue': 'Лена забирает сама'}}},
+        ]
+        ctx = FakeContext(FakeClient({'supply': [supply]}, audit_events=events))
+        found = await RetroEditCheck().detect(ctx, None)
+        assert len(found) == 1
+        changes = found[0].payload['changes_after_doc_date']
+        assert len(changes) == 1 and 'positions' in changes[0]['diff']
+
+    async def test_linked_documents_in_payload(self):
+        supply = _doc('supply', 's7', '00085', '2026-08-12 12:32:00',
+                      updated='2026-08-14 14:50:00', created='2026-08-12 12:33:00',
+                      purchaseOrder={'name': '00083', 'moment': '2026-08-12 12:30:00',
+                                     'sum': 200000.0,
+                                     'meta': {'type': 'purchaseorder'}})
+        ctx = FakeContext(FakeClient({'supply': [supply]}))
+        found = await RetroEditCheck().detect(ctx, None)
+        assert found[0].payload['linked_documents'] == [
+            'Заказ поставщику №00083 от 2026-08-12 на 2 000,00 ₽']
+
     async def test_fingerprint_new_on_another_day_edit(self):
         check = RetroEditCheck()
         supply = _doc('supply', 's1', '00025', '2026-04-01 10:00:00',
@@ -470,6 +552,30 @@ class TestCounterpartyBalance:
         assert 'переплата поставщику' in found[0].payload['signals'][0]
         # суммы в payload — в рублях: аналитик путался в конвертации копеек
         assert found[0].payload['paid_out_rub'] == 42140.0
+
+    async def test_marketplace_debt_is_not_a_problem(self):
+        # Озон платит реестром за период — долг по отгрузкам выравнивается выплатой
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        ozon = self._agent('oz', 'ООО "Ozon Маркетплейс"')
+        data = {'demand': [_doc('demand', 'd1', '00204', '2026-08-16 10:00:00',
+                                sum=11728000, agent=ozon)]}
+        ctx = FakeContext(FakeClient(data))
+        assert await CounterpartyBalanceCheck().detect(ctx, None) == []
+
+    async def test_marketplace_overpayment_still_flagged(self):
+        # получено больше, чем отгружено — аномалия даже для маркетплейса
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        ozon = self._agent('oz', 'ООО "Ozon Маркетплейс"')
+        data = {
+            'demand': [_doc('demand', 'd1', '00204', '2026-08-16 10:00:00',
+                            sum=100000, agent=ozon)],
+            'paymentin': [_doc('paymentin', 'pi1', '00300', '2026-08-17 10:00:00',
+                               sum=500000, agent=ozon)],
+        }
+        ctx = FakeContext(FakeClient(data))
+        found = await CounterpartyBalanceCheck().detect(ctx, None)
+        assert len(found) == 1
+        assert 'получено больше' in found[0].payload['signals'][0]
 
     async def test_balanced_counterparty_silent(self):
         from services.audit.checks.money import CounterpartyBalanceCheck
@@ -731,6 +837,16 @@ class TestProductionRetroEdit:
         from services.audit.checks.production import ProductionRetroEditCheck
         task = self._task('t2', '00091', '2026-06-01 10:00:00',
                           updated='2026-07-01 16:00:00', production_end=None)
+        ctx = FakeContext(FakeClient({'productiontask': [task]}))
+        assert await ProductionRetroEditCheck().detect(ctx, None) == []
+
+    async def test_task_created_after_completion_is_not_an_edit(self):
+        # ПЗ занесли в МС уже после того, как производство закончили — правок не было
+        from services.audit.checks.production import ProductionRetroEditCheck
+        task = self._task('t4', '00093', '2026-07-01 10:00:00',
+                          updated='2026-07-10 12:00:00',
+                          production_end='2026-07-02 18:00:00')
+        task['created'] = '2026-07-10 12:00:00'
         ctx = FakeContext(FakeClient({'productiontask': [task]}))
         assert await ProductionRetroEditCheck().detect(ctx, None) == []
 

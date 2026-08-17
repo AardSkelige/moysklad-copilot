@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta
 
-from services.audit.context import AuditContext, format_moment
+from services.audit.context import AuditContext, format_moment, linked_documents
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 
@@ -16,6 +16,7 @@ def _slim_doc(d: dict) -> dict:
         'agent': ((d.get('agent') or {}).get('name')
                   if isinstance(d.get('agent'), dict) else None),
         'description': (d.get('description') or '')[:300],
+        'linked_documents': linked_documents(d),
     }
 
 
@@ -31,7 +32,7 @@ class SupplyZeroPriceCheck(CheckSpec):
         docs = await ctx.client.list_entities(
             ctx.session, 'supply',
             filters=filters + ';applicable=true',
-            expand='positions.assortment,agent',
+            expand='positions.assortment,agent,purchaseOrder,payments',
             order='moment,desc',
         )
         fifo = await ctx.stock_fifo_map()

@@ -3,7 +3,13 @@
 from datetime import datetime, timedelta
 
 from core import config
-from services.audit.context import AuditContext, delivery_method, format_moment, parse_moment
+from services.audit.context import (
+    AuditContext,
+    delivery_method,
+    format_moment,
+    is_marketplace,
+    parse_moment,
+)
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 
@@ -88,6 +94,12 @@ class DemandNoOverheadCheck(CheckSpec):
         for d in docs:
             if (d.get('overhead') or {}).get('sum', 0) > 0:
                 continue
+            agent_name = ((d.get('agent') or {}).get('name')
+                          if isinstance(d.get('agent'), dict) else None)
+            if is_marketplace(agent_name):
+                # товар отдают в ПВЗ, дальше везёт маркетплейс — накладных расходов
+                # тут не бывает вовсе, спрашивать про них незачем
+                continue
             # накладные расходы и комментарий часто вносят на следующий день
             try:
                 if parse_moment(d['moment']) > grace:
@@ -103,8 +115,7 @@ class DemandNoOverheadCheck(CheckSpec):
                 severity=self.default_severity,
                 payload={
                     'moment': (d.get('moment') or '')[:16],
-                    'agent': ((d.get('agent') or {}).get('name')
-                              if isinstance(d.get('agent'), dict) else None),
+                    'agent': agent_name,
                     'sum_kopecks': d.get('sum', 0),
                     'description': (d.get('description') or '')[:300],
                     'customer_order': (f'Заказ покупателя №{order["name"]}'

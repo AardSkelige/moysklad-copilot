@@ -7,7 +7,7 @@ productiontask не поддерживает filter=applicable (API отвеча
 from datetime import datetime, timedelta
 
 from core import config
-from services.audit.checks.cross import _slim_audit_events
+from services.audit.checks.cross import _slim_audit_events, events_after, is_cosmetic
 from services.audit.context import AuditContext, format_moment, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
@@ -45,19 +45,29 @@ class ProductionRetroEditCheck(CheckSpec):
             if not production_end:
                 continue   # производство не завершено — правки легальны
             try:
-                gap = parse_moment(d['updated']) - parse_moment(production_end)
+                # ПЗ, заведённое в МС уже после завершения производства, правкой не считается:
+                # отсчёт от создания, иначе оформление постфактум само даёт разрыв
+                baseline = max(parse_moment(production_end),
+                               parse_moment(d.get('created') or production_end))
+                gap = parse_moment(d['updated']) - baseline
             except (KeyError, ValueError):
                 continue
             if gap <= threshold:
                 continue
             events = []
+            history_checked = False
             if diffs_budget > 0:
                 try:
-                    events = _slim_audit_events(
+                    # как и для складских документов: правки в первые сутки — дозаполнение
+                    raw_events = events_after(
                         await ctx.client.entity_audit_events(ctx.session, 'productiontask', d['id']),
-                        after=production_end,
+                        format_moment(baseline + threshold),
                     )
+                    history_checked = True
                     diffs_budget -= 1
+                    if is_cosmetic(raw_events):
+                        continue   # правили только комментарий/номер — учёт не затронут
+                    events = _slim_audit_events(raw_events)
                 except Exception:
                     pass
             out.append(RawFinding(
@@ -69,11 +79,13 @@ class ProductionRetroEditCheck(CheckSpec):
                 payload={
                     'doc_moment': (d.get('moment') or '')[:16],
                     'production_end': (production_end or '')[:16],
+                    'created': (d.get('created') or '')[:16],
                     'updated': (d.get('updated') or '')[:16],
                     'gap_days_after_completion': round(gap.total_seconds() / 86400, 1),
                     'state': (d.get('state') or {}).get('name', ''),
                     'description': (d.get('description') or '')[:300],
                     'changes_after_completion': events,
+                    'history_checked': history_checked,
                 },
                 fingerprint_salt=d['updated'][:10],
             ))
