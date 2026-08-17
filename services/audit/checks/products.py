@@ -13,6 +13,26 @@ _DEVIATION_CRITICAL = 0.50    # >50% — похоже на ошибку един
 _DEVIATION_IMPORTANT = 0.15   # 15–50% — рост цены/накладные, стоит взглянуть
 
 
+def _uom(row: dict) -> str:
+    """Единица измерения товара из отчёта остатков: сырьё бывает в г, мл, л, шт —
+    без неё LLM подставляет «кг» наугад и раздувает масштаб находки."""
+    return ((row.get('uom') or {}).get('name') or '').strip()
+
+
+def _payment_state(doc: dict) -> str:
+    """«Оплачен ли документ» словами — цена, за которую заплатили ровно столько же,
+    не может быть опечаткой ввода, и версию «лишний ноль» предлагать бессмысленно."""
+    total, payed = doc.get('sum'), doc.get('payedSum')
+    if total is None or payed is None:
+        return 'оплата неизвестна'
+    if payed >= total > 0:
+        return f'оплачен полностью ({total / 100:,.2f} ₽)'.replace(',', ' ').replace('.', ',')
+    if payed > 0:
+        return (f'оплачен частично ({payed / 100:,.2f} из {total / 100:,.2f} ₽)'
+                .replace(',', ' ').replace('.', ','))
+    return 'не оплачен'
+
+
 async def _last_supply_prices(ctx: AuditContext) -> dict[str, dict]:
     """href товара -> цена из самой свежей приёмки за окно сканирования."""
     docs = await ctx.cached_list(
@@ -32,6 +52,7 @@ async def _last_supply_prices(ctx: AuditContext) -> dict[str, dict]:
                     'supply': d.get('name'),
                     'moment': (d.get('moment') or '')[:10],
                     'comment': (d.get('description') or '')[:200],
+                    'payment': _payment_state(d),
                 }
     return out
 
@@ -61,12 +82,15 @@ async def _product_source_docs(ctx: AuditContext) -> tuple[dict[str, list], dict
                     continue
                 if a.get('meta', {}).get('uuidHref'):
                     ui_links[href] = a['meta']['uuidHref']
-                sources.setdefault(href, []).append({
+                source = {
                     'doc': f'{label} №{d.get("name")} от {(d.get("moment") or "")[:10]}',
                     'quantity': p.get('quantity'),
                     'price_kopecks': p.get('price', 0),
                     'comment': (d.get('description') or '')[:200],
-                })
+                }
+                if entity == 'supply':   # у оприходования оплаты не бывает
+                    source['payment'] = _payment_state(d)
+                sources.setdefault(href, []).append(source)
     return sources, ui_links
 
 
@@ -102,6 +126,7 @@ class FifoZeroCheck(CheckSpec):
                     'product': r.get('name'),
                     'folder': (r.get('folder') or {}).get('name', ''),
                     'stock': r.get('stock'),
+                    'uom': _uom(r),
                     'fifo_kopecks': 0,
                     'last_supply': last.get(href),
                     'source_documents': sources.get(href, [])[:6],
@@ -116,8 +141,9 @@ class FifoZeroCheck(CheckSpec):
         return out
 
     def explain(self, payload: dict) -> str:
-        return (f'Остаток {payload.get("stock")}, себестоимость 0 ₽. '
-                f'Всё, что производится из этого товара, получит заниженную себестоимость.')
+        return (f'Остаток {payload.get("stock")} {payload.get("uom", "")}'.rstrip() +
+                ', себестоимость 0 ₽. '
+                'Всё, что производится из этого товара, получит заниженную себестоимость.')
 
 
 class FifoDeviationCheck(CheckSpec):
@@ -161,7 +187,9 @@ class FifoDeviationCheck(CheckSpec):
                     'product': r.get('name'),
                     'folder': (r.get('folder') or {}).get('name', ''),
                     'stock': r.get('stock'),
+                    'uom': _uom(r),
                     'fifo_kopecks': fifo,
+                    'stock_value_kopecks': round(fifo * r.get('stock', 0)),
                     'last_supply': ls,
                     'deviation_percent': round(deviation * 100, 1),
                     'source_documents': sources.get(href, [])[:6],
@@ -169,7 +197,12 @@ class FifoDeviationCheck(CheckSpec):
                              '(единицы измерения, лишний ноль); 15–50% — рост цены '
                              'или накладные расходы. ЧИТАЙ комментарии документов-'
                              'источников: бесплатные партии в истории объясняют '
-                             'заниженный FIFO без чьей-либо ошибки.'),
+                             'заниженный FIFO без чьей-либо ошибки. Поле payment '
+                             'у источника — проверка версии «опечатка в цене»: '
+                             'если документ оплачен полностью, сумма подтверждена '
+                             'деньгами и версию про лишний ноль НЕ предлагай, '
+                             'разница цен — вопрос закупки, а не учёта. '
+                             'stock_value — цена вопроса, соразмеряй с ней выводы.'),
                 },
                 # новая приёмка = новая точка сравнения = новый сигнал
                 fingerprint_salt=str(ls['supply']),
@@ -179,7 +212,8 @@ class FifoDeviationCheck(CheckSpec):
 
     def explain(self, payload: dict) -> str:
         ls = payload.get('last_supply') or {}
-        return (f'FIFO {payload.get("fifo_kopecks", 0) / 100:,.2f} ₽ против '
-                f'{ls.get("price_kopecks", 0) / 100:,.2f} ₽ в приёмке №{ls.get("supply")} '
-                f'от {ls.get("moment")} — отклонение {payload.get("deviation_percent")}%.'
-                ).replace(',', ' ')
+        per = f'/{payload["uom"]}' if payload.get('uom') else ''
+        return (f'FIFO {payload.get("fifo_kopecks", 0) / 100:,.2f} ₽{per} против '
+                f'{ls.get("price_kopecks", 0) / 100:,.2f} ₽{per} в приёмке '
+                f'№{ls.get("supply")} от {ls.get("moment")} — отклонение '
+                f'{payload.get("deviation_percent")}%.').replace(',', ' ')

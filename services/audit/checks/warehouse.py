@@ -29,6 +29,7 @@ class EnterPriceVsFifoCheck(CheckSpec):
             order='moment,desc',
         )
         fifo = await ctx.stock_fifo_map()
+        uoms = await ctx.uom_map()
         out = []
         for d in docs:
             suspicious = []
@@ -46,6 +47,7 @@ class EnterPriceVsFifoCheck(CheckSpec):
                 suspicious.append({
                     'product': a.get('name', '?'),
                     'quantity': p.get('quantity', 0),
+                    'uom': uoms.get(href, ''),
                     'price_kopecks': price,
                     'current_fifo_kopecks': fifo_price,
                     'signal': kind,

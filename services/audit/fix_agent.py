@@ -11,6 +11,7 @@ import aiohttp
 
 from services.agent_loop import run_agent_step
 from services.audit.fix_service import FixPreview, validate_actions
+from services.audit.humanize import humanize_money
 from services.audit.team_context import SPEAK_RULES, TEAM_CONTEXT
 from services.llm_service import LLMClient
 
@@ -245,12 +246,17 @@ def _system_prompt(finding_context: dict) -> str:
         'Вы обсуждаете ОДНУ конкретную находку аудита (ниже). Владелец решает — ты помогаешь: '
         'отвечаешь на вопросы, смотришь документ и историю изменений, предлагаешь варианты '
         'с последствиями.\n\n'
-        f'НАХОДКА:\n{json.dumps(finding_context, ensure_ascii=False, default=str)}\n\n'
+        f'НАХОДКА:\n'
+        f'{json.dumps(humanize_money(finding_context, keep_raw=True), ensure_ascii=False, default=str)}\n\n'
         'Правила:\n'
         '• Сначала пойми ситуацию (get_document / get_positions / get_audit_events), потом советуй.\n'
         '• НЕ утверждай того, чего не видел в результатах tools (например, что документ '
         'удалён или поля нет). Если данных нет — так и скажи: «в данных не вижу».\n'
-        '• Суммы и цены в МойСклад — в КОПЕЙКАХ; пользователю показывай в рублях.\n'
+        '• В карточке находки рядом стоят две формы одной суммы: «price» — уже в рублях '
+        '(её и показывай), «price_kopecks» — сырое значение API для действий. '
+        'Из tools суммы приходят в КОПЕЙКАХ — их дели на 100 перед показом.\n'
+        '• Цена и себестоимость — за ОДНУ единицу измерения товара (uom: г, мл, шт). '
+        'Не пересчитывай в килограммы и литры и не подставляй единицу от себя.\n'
         '• Платежи за услуги/доставку НИКОГДА не привязывай к отгрузкам и заказам — '
         'это ломает баланс контрагента (не деньги за товар). Такой платёж создаётся '
         'отдельно (create_payment) с галкой «Без закрывающих документов»: перевозчика '

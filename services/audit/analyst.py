@@ -8,6 +8,7 @@ DeepSeek: проблема / норма / непонятно, плюс объя�
 import json
 
 from core.logger import logger
+from services.audit.humanize import humanize_money
 from services.audit.team_context import COMPANY_DESCRIPTION, SPEAK_RULES, TEAM_CONTEXT
 from services.llm_service import LLMClient
 
@@ -50,6 +51,10 @@ _SYSTEM = (
     'а не про время правки.\n'
     '- Комментарии обычно начинаются с имени сотрудника.\n'
     f'{TEAM_CONTEXT}\n{SPEAK_RULES}\n\n'
+    'ВАЖНО про числа в фактах: суммы и цены УЖЕ переведены в рубли («0,45 ₽») — '
+    'НЕ дели их ни на что, показывай как есть. Цена и себестоимость — за ОДНУ '
+    'единицу измерения товара (поле uom: г, мл, шт), не за килограмм и не за литр; '
+    'единицу в тексте бери только из uom, не подставляй свою.\n\n'
     'Если в фактах есть история изменений (changes_after_doc_date / '
     'changes_after_completion) — ОБЯЗАТЕЛЬНО перескажи в explanation, ЧТО именно '
     'менялось, по-русски: какие поля, старое → новое значение, когда '
@@ -76,9 +81,11 @@ class AuditAnalyst:
 
     async def triage(self, check_title: str, facts: dict) -> dict | None:
         """Вернуть {'verdict', 'severity', 'explanation', 'suggestions'} или None при сбое LLM."""
+        # деньги переводим в рубли кодом: LLM ошибается в 100 раз, читая копейки
         user_msg = (
             f'Сигнал проверки: {check_title}\n'
-            f'Факты (JSON из МойСклад API):\n{json.dumps(facts, ensure_ascii=False, default=str)}'
+            f'Факты (JSON из МойСклад API, суммы уже в рублях):\n'
+            f'{json.dumps(humanize_money(facts), ensure_ascii=False, default=str)}'
         )
         try:
             resp = await self.llm.chat([

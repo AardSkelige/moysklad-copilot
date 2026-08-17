@@ -8,6 +8,7 @@ import pytest
 
 from services.audit.checks.cross import RetroEditCheck
 from services.audit.checks.money import PaymentDuplicateCheck
+from services.audit.checks.products import FifoDeviationCheck
 from services.audit.checks.purchases import SupplyZeroPriceCheck
 from services.audit.checks.sales import DemandZeroCheck
 from services.audit.checks.warehouse import EnterPriceVsFifoCheck
@@ -62,9 +63,19 @@ class FakeContext:
             r['meta']['href'].split('?')[0]: (r.get('price', 0), r.get('stock', 0))
             for r in client.stock
         }
+        self._uom = {
+            r['meta']['href'].split('?')[0]: ((r.get('uom') or {}).get('name') or '')
+            for r in client.stock
+        }
+
+    async def stock_rows(self):
+        return self.client.stock
 
     async def stock_fifo_map(self):
         return self._fifo
+
+    async def uom_map(self):
+        return self._uom
 
     async def cached_list(self, key, entity, **kwargs):
         return await self.client.list_entities(self.session, entity, **kwargs)
@@ -189,6 +200,61 @@ class TestEnterPriceVsFifo:
         ]})
         ctx = FakeContext(FakeClient({'enter': [enter]}, stock=stock))
         assert await EnterPriceVsFifoCheck().detect(ctx, None) == []
+
+
+class TestFifoDeviation:
+    """Живой кейс: Лауроилглутамат натрия, 95% — сырьё в ГРАММАХ.
+
+    Приёмка №00065 — 0,45 ₽/г (45 копеек), оплачена ровно на сумму заказа;
+    приёмка №00079 — 1,70 ₽/г. FIFO 0,8079 ₽/г, отклонение 52,5%.
+    """
+
+    STOCK = [{'meta': {'href': f'{MS}/entity/product/p1'},
+              'name': 'Лауроилглутамат натрия, 95%',
+              'price': 80.7866311051842, 'stock': 5999.0,
+              'uom': {'name': 'г'}, 'folder': {'name': 'Сырьё'}}]
+
+    def _supplies(self):
+        return [
+            _doc('supply', 's79', '00079', '2026-08-05 17:52:00',
+                 description='Яна: приняла на склад производства.',
+                 sum=650000, payedSum=650000,
+                 positions={'rows': [
+                     {'price': 170, 'quantity': 1000,
+                      'assortment': _product_meta('p1', 'Лауроилглутамат натрия, 95%')}]}),
+            _doc('supply', 's65', '00065', '2026-07-19 13:32:00',
+                 description='Яна: приняла на склад производства.',
+                 sum=1125000, payedSum=1125000,
+                 positions={'rows': [
+                     {'price': 45, 'quantity': 5000,
+                      'assortment': _product_meta('p1', 'Лауроилглутамат натрия, 95%')}]}),
+        ]
+
+    async def _detect(self):
+        ctx = FakeContext(FakeClient({'supply': self._supplies()}, stock=self.STOCK))
+        return await FifoDeviationCheck().detect(ctx, None)
+
+    async def test_unit_of_measure_from_stock_report(self):
+        found = await self._detect()
+        assert len(found) == 1
+        assert found[0].payload['uom'] == 'г'   # не «кг», которое LLM подставляла сама
+
+    async def test_stock_value_shows_scale_of_problem(self):
+        found = await self._detect()
+        # 5999 г × 0,8079 ₽ ≈ 4 846 ₽ — цена вопроса, а не «весь остаток сырья»
+        assert found[0].payload['stock_value_kopecks'] == pytest.approx(484639, abs=2)
+
+    async def test_paid_supply_marked_as_confirmed_by_money(self):
+        found = await self._detect()
+        payload = found[0].payload
+        assert payload['last_supply']['payment'] == 'оплачен полностью (6 500,00 ₽)'
+        paid_states = [s['payment'] for s in payload['source_documents']]
+        assert 'оплачен полностью (11 250,00 ₽)' in paid_states
+
+    async def test_explain_names_the_unit(self):
+        found = await self._detect()
+        text = FifoDeviationCheck().explain(found[0].payload)
+        assert '0.81 ₽/г' in text and '1.70 ₽/г' in text
 
 
 class TestOrderSupplyMismatch:

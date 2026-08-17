@@ -46,12 +46,32 @@ class AuditContext:
             self._cache[key] = await self.client.list_entities(self.session, entity, **kwargs)
         return self._cache[key]
 
+    async def stock_rows(self) -> list[dict]:
+        """Сырые строки отчёта остатков (вес 5) — один запрос на весь прогон."""
+        if 'stock_rows' not in self._cache:
+            self._cache['stock_rows'] = await self.client.stock_all(
+                self.session, stock_mode='all')
+        return self._cache['stock_rows']
+
     async def stock_fifo_map(self) -> dict[str, tuple[float, float]]:
         """href товара (без query) -> (FIFO-цена в копейках, остаток)."""
         if 'stock_fifo' not in self._cache:
-            rows = await self.client.stock_all(self.session, stock_mode='all')
             self._cache['stock_fifo'] = {
                 r.get('meta', {}).get('href', '').split('?')[0]: (r.get('price', 0), r.get('stock', 0))
-                for r in rows
+                for r in await self.stock_rows()
             }
         return self._cache['stock_fifo']
+
+    async def uom_map(self) -> dict[str, str]:
+        """href товара -> единица измерения («г», «мл», «шт»).
+
+        Цены в МойСклад — за единицу товара, и для сырья это грамм или миллилитр.
+        Без единицы цена «0,45 ₽» читается как цена за килограмм и вводит в заблуждение.
+        """
+        if 'uom' not in self._cache:
+            self._cache['uom'] = {
+                r.get('meta', {}).get('href', '').split('?')[0]:
+                    ((r.get('uom') or {}).get('name') or '').strip()
+                for r in await self.stock_rows()
+            }
+        return self._cache['uom']
