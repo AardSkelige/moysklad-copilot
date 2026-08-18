@@ -2,7 +2,12 @@
 
 from datetime import datetime, timedelta
 
-from services.audit.context import AuditContext, format_moment, linked_documents
+from services.audit.context import (
+    AuditContext,
+    format_moment,
+    is_free_supplier,
+    linked_documents,
+)
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 
@@ -39,6 +44,10 @@ class SupplyZeroPriceCheck(CheckSpec):
         uoms = await ctx.uom_map()
         out = []
         for d in docs:
+            agent_name = ((d.get('agent') or {}).get('name')
+                          if isinstance(d.get('agent'), dict) else None)
+            if is_free_supplier(agent_name):
+                continue   # типография печатает этикетки бесплатно — ноль штатен
             zero = []
             for p in d.get('positions', {}).get('rows', []):
                 if p.get('price', 0) == 0:

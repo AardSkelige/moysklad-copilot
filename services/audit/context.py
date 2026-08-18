@@ -86,6 +86,13 @@ def is_internal_agent(agent_name: str | None) -> bool:
         a.lower() in agent_name.lower() for a in INTERNAL_AGENTS)
 
 
+def is_free_supplier(agent_name: str | None) -> bool:
+    """Поставщик отдаёт товар бесплатно по договорённости — ноль в цене штатен."""
+    from services.audit.team_context import FREE_SUPPLIERS
+    return bool(agent_name) and any(
+        s.lower() in agent_name.lower() for s in FREE_SUPPLIERS)
+
+
 def is_consolidated_carrier(delivery: str | None) -> bool:
     """Перевозчик выставляет сводный счёт за период — парного платежа не ищем."""
     from services.audit.team_context import CONSOLIDATED_CARRIERS

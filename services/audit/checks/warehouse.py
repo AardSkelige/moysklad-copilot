@@ -2,18 +2,24 @@
 
 from datetime import datetime
 
+from services.audit.checks.products import _product_source_docs, previous_receipt_price
 from services.audit.context import AuditContext, format_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
-_FIFO_DEVIATION_THRESHOLD = 0.10   # 10% отклонения цены оприходования от FIFO — сигнал
-# (живой кейс: основа шампуня оприходована по 52,20 при FIFO 60,27 — отклонение 13,4%)
+# Хозтовары и упаковку покупают в разных магазинах, и цена гуляет: стрейч-плёнка
+# бралась по 498 и 733 ₽. Ниже 30% — обычный разброс закупки, а не ошибка учёта.
+_FIFO_DEVIATION_THRESHOLD = 0.30
 
 
 class EnterPriceVsFifoCheck(CheckSpec):
     """Оприходование — «создание товара из ничего», цена напрямую бьёт по себестоимости.
 
     Сигналы: цена 0 при ненулевом FIFO (кейс бесплатных этикеток LLM отличит по комментарию)
-    и заметное отклонение от FIFO (кейс «Основа шампуня» по 52,20 при FIFO 60,27)."""
+    и заметное отклонение от цены ПРЕДЫДУЩЕГО поступления того же товара.
+
+    Сравнивать с текущим FIFO нельзя: он средневзвешенный по остатку, а оприходование
+    фиксирует цену конкретной покупки. Стрейч-плёнку покупали по 498, 720 и 733 ₽ при
+    средней 576 ₽ — три «отклонения» на ровном месте."""
 
     id = 'enter_price_vs_fifo'
     section = Section.WAREHOUSE
@@ -30,18 +36,22 @@ class EnterPriceVsFifoCheck(CheckSpec):
         )
         fifo = await ctx.stock_fifo_map()
         uoms = await ctx.uom_map()
+        sources, _ = await _product_source_docs(ctx)
         out = []
         for d in docs:
             suspicious = []
             for p in d.get('positions', {}).get('rows', []):
                 a = p.get('assortment', {})
                 href = a.get('meta', {}).get('href', '').split('?')[0]
-                fifo_price, _ = fifo.get(href, (0, 0))
+                fifo_price, _stock = fifo.get(href, (0, 0))
                 price = p.get('price', 0)
+                previous = previous_receipt_price(sources.get(href, []), (d.get('moment') or '')[:19])
+                prev_price = (previous or {}).get('price_kopecks') or 0
                 if fifo_price and price == 0:
                     kind = 'цена 0 при ненулевой себестоимости'
-                elif fifo_price and abs(price - fifo_price) / fifo_price > _FIFO_DEVIATION_THRESHOLD:
-                    kind = 'отклонение от текущего FIFO'
+                elif (prev_price
+                      and abs(price - prev_price) / prev_price > _FIFO_DEVIATION_THRESHOLD):
+                    kind = 'отклонение от цены прошлого поступления'
                 else:
                     continue
                 suspicious.append({
@@ -49,6 +59,7 @@ class EnterPriceVsFifoCheck(CheckSpec):
                     'quantity': p.get('quantity', 0),
                     'uom': uoms.get(href, ''),
                     'price_kopecks': price,
+                    'previous_receipt': previous,
                     'current_fifo_kopecks': fifo_price,
                     'signal': kind,
                 })

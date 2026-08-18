@@ -6,7 +6,7 @@
 
 from datetime import datetime
 
-from services.audit.context import AuditContext
+from services.audit.context import AuditContext, is_free_supplier
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 _DEVIATION_CRITICAL = 0.50    # >50% — похоже на ошибку единиц измерения (кг вместо г и т.п.)
@@ -16,8 +16,10 @@ _MAX_BATCH_REPORTS = 60       # запрос партий только по ка
 # Маркеры бесплатного поступления в комментарии документа-источника: этикетки от
 # типографии, образцы от технолога, упаковка «взял в ХБ». Для них ноль — норма,
 # и решать это должен код: гонять LLM ради чтения слова «бесплатно» незачем.
-_FREE_MARKERS = ('бесплатн', 'на пробу', 'подарок', 'подарен', 'по нулевым',
-                 'нулевая стоимость', 'нулевой суммы', 'даром', 'отдали', 'отдал')
+# «нулев» одним корнем: в живых комментариях встречаются «нулевая стоимость»,
+# «нулевой суммы», «по нулевым ценам» — падежи перечислять бессмысленно
+_FREE_MARKERS = ('бесплатн', 'на пробу', 'подарок', 'подарен', 'нулев',
+                 'даром', 'отдали', 'отдал')
 
 
 def _previously_priced(sources: list[dict]) -> dict | None:
@@ -31,7 +33,13 @@ def _previously_priced(sources: list[dict]) -> dict | None:
 
 
 def _explained_as_free(payload_docs: list[dict], last_supply: dict | None) -> bool:
-    """Все документы-источники объясняют ноль бесплатным поступлением."""
+    """Ноль объяснён: бесплатный поставщик или прямая оговорка в комментарии."""
+    # ноль от бесплатного поставщика штатен в любом поступлении, не только
+    # в последнем: приёмки старше окна сканирования в last_supply не попадают
+    if last_supply and is_free_supplier(last_supply.get('agent')):
+        return True
+    if any(is_free_supplier(d.get('agent')) for d in payload_docs):
+        return True
     comments = [(d.get('comment') or '') for d in payload_docs]
     if last_supply:
         comments.append(last_supply.get('comment') or '')
@@ -83,7 +91,7 @@ async def _last_supply_prices(ctx: AuditContext) -> dict[str, dict]:
     docs = await ctx.cached_list(
         'supply_full_window', 'supply',
         filters=f'moment>={ctx.scan_since_moment};applicable=true',
-        expand='positions.assortment',
+        expand='positions.assortment,agent',
         order='moment,desc',
     )
     out: dict[str, dict] = {}
@@ -93,6 +101,8 @@ async def _last_supply_prices(ctx: AuditContext) -> dict[str, dict]:
             href = a.get('meta', {}).get('href', '').split('?')[0]
             if href and href not in out:
                 out[href] = {
+                    'agent': ((d.get('agent') or {}).get('name')
+                              if isinstance(d.get('agent'), dict) else None),
                     'price_kopecks': p.get('price', 0),
                     # с накладными: именно эту величину и показывает FIFO
                     'cost_with_overhead_kopecks': _with_overhead(p.get('price', 0), d),
@@ -118,7 +128,7 @@ async def _product_source_docs(ctx: AuditContext) -> tuple[dict[str, list], dict
     for entity, label in (('supply', 'Приёмка'), ('enter', 'Оприходование')):
         docs = await ctx.cached_list(
             f'{entity}_all_history', entity,
-            expand='positions.assortment',
+            expand='positions.assortment,agent',
             order='moment,asc',
             max_rows=2000,
         )
@@ -132,6 +142,9 @@ async def _product_source_docs(ctx: AuditContext) -> tuple[dict[str, list], dict
                     ui_links[href] = a['meta']['uuidHref']
                 source = {
                     'doc': f'{label} №{d.get("name")} от {(d.get("moment") or "")[:10]}',
+                    'moment': (d.get('moment') or '')[:19],
+                    'agent': ((d.get('agent') or {}).get('name')
+                              if isinstance(d.get('agent'), dict) else None),
                     'quantity': p.get('quantity'),
                     'price_kopecks': p.get('price', 0),
                     'comment': (d.get('description') or '')[:200],
@@ -140,6 +153,18 @@ async def _product_source_docs(ctx: AuditContext) -> tuple[dict[str, list], dict
                     source['payment'] = _payment_state(d)
                 sources.setdefault(href, []).append(source)
     return sources, ui_links
+
+
+def previous_receipt_price(sources: list[dict], before_moment: str) -> dict | None:
+    """Последнее поступление товара с ценой СТРОГО раньше указанного момента.
+
+    Оприходование фиксирует цену конкретной покупки, а FIFO — среднюю по остатку:
+    стрейч-плёнку брали по 498, 720 и 733 ₽ при средней 576 ₽, и сравнение со
+    средней объявляло ошибкой обычный разброс закупочных цен."""
+    earlier = [s for s in sources
+               if (s.get('price_kopecks') or 0) > 0
+               and (s.get('moment') or '') < before_moment]
+    return earlier[-1] if earlier else None
 
 
 class FifoZeroCheck(CheckSpec):

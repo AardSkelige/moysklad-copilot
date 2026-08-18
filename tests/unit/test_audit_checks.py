@@ -172,19 +172,24 @@ class TestPaymentDuplicate:
 
 class TestEnterPriceVsFifo:
     async def test_detects_live_case_osnova(self):
-        # Живой кейс: основа по 52,20 при FIFO 60,27 (отклонение 13,4%)
+        # Основа по 39,00 при прошлом поступлении 60,27 — отклонение 35%, выше порога 30%
         stock = [{'meta': {'href': f'{MS}/entity/product/p1'}, 'name': 'Основа шампуня 500 мл',
                   'price': 6027, 'stock': 155}]
+        earlier = _doc('enter', 'e0', '00001', '2026-06-01 12:00:00',
+                       positions={'rows': [
+                           {'price': 6027, 'quantity': 10,
+                            'assortment': _product_meta('p1', 'Основа шампуня 500 мл')},
+                       ]})
         enter = _doc('enter', 'e1', '00002-00003', '2026-06-18 12:00:00',
                      description='Аня оприходовала основы',
                      positions={'rows': [
-                         {'price': 5220, 'quantity': 7,
+                         {'price': 3900, 'quantity': 7,
                           'assortment': _product_meta('p1', 'Основа шампуня 500 мл')},
                      ]})
-        ctx = FakeContext(FakeClient({'enter': [enter]}, stock=stock))
+        ctx = FakeContext(FakeClient({'enter': [earlier, enter]}, stock=stock))
         found = await EnterPriceVsFifoCheck().detect(ctx, None)
         assert len(found) == 1
-        assert found[0].payload['positions'][0]['signal'] == 'отклонение от текущего FIFO'
+        assert found[0].payload['positions'][0]['signal'] == 'отклонение от цены прошлого поступления'
 
     async def test_zero_price_with_nonzero_fifo(self):
         stock = [{'meta': {'href': f'{MS}/entity/product/p1'}, 'name': 'Диметилфталат',
@@ -472,6 +477,22 @@ class TestDemandOverheadPayment:
         assert found[0].payload['delivery_method'] == 'ТК Байкал'
         assert 'БЕЗ привязки' in found[0].payload['fix_hint']
         assert 'create_payment' in found[0].payload['fix_hint']
+
+
+class TestEnterPriceSpread:
+    async def test_price_spread_between_purchases_is_not_an_error(self):
+        # Стрейч-плёнку покупали по 4,98 / 7,20 / 7,33 ₽ при средней 5,76 ₽:
+        # сравнение с ПРОШЛОЙ покупкой, а не со средней, разброс не считает ошибкой
+        from services.audit.checks.warehouse import EnterPriceVsFifoCheck
+        stock = [{'meta': {'href': f'{MS}/entity/product/p7'}, 'name': 'Стрейч плёнка',
+                  'price': 57627, 'stock': 4}]
+        first = _doc('enter', 'x1', '00012', '2026-06-10 10:00:00', positions={'rows': [
+            {'price': 72015, 'quantity': 1, 'assortment': _product_meta('p7', 'Стрейч плёнка')}]})
+        second = _doc('enter', 'x2', '00034', '2026-08-12 10:00:00', positions={'rows': [
+            {'price': 73280, 'quantity': 1, 'assortment': _product_meta('p7', 'Стрейч плёнка')}]})
+        ctx = FakeContext(FakeClient({'enter': [first, second]}, stock=stock))
+        found = await EnterPriceVsFifoCheck().detect(ctx, None)
+        assert [f.entity_name for f in found] == []
 
 
 class TestRetroEdit:
