@@ -79,7 +79,19 @@ async def mark_shown(session: AsyncSession, doc: dict):
 
 
 async def record_applied(session: AsyncSession, item: dict):
-    """После «Заменить» запомнить записанное состояние — правка бота не обнуляет счётчик."""
+    """После «Заменить» документ считается разобранным.
+
+    Мало запомнить новое состояние: при shown_count < MAX_SHOWS документ попадал
+    в ревью ещё раз, LLM видела там уже собственный текст и правила его повторно —
+    так «заказ 94709764-0166-1й» на втором проходе превратился в «…-1». Владелец
+    решение принял, повторно спрашивать не о чем. Если текст потом изменят руками,
+    хэш разойдётся и документ снова станет доступен со счётом заново."""
     row = await _get_row(session, item)
-    if row is not None:
-        row.state_hash = _state_hash(item, applied=True)
+    if row is None:
+        session.add(CommentReviewSeen(entity=item['entity'], entity_id=item['id'],
+                                      shown_count=MAX_SHOWS,
+                                      state_hash=_state_hash(item, applied=True),
+                                      last_shown_at=datetime.now()))
+        return
+    row.state_hash = _state_hash(item, applied=True)
+    row.shown_count = MAX_SHOWS

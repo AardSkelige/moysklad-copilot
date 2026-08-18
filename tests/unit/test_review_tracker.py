@@ -65,6 +65,24 @@ class TestRecordApplied:
         await review_tracker.mark_shown(test_db, after)
         assert await review_tracker.filter_seen(test_db, [after]) == []
 
+    async def test_applied_doc_not_offered_again(self, test_db):
+        # Живой баг: документ, показанный один раз и исправленный, попадал в ревью
+        # ещё раз, и LLM правила уже собственный текст («…-1й» → «…-1»)
+        doc = _doc(comment='Лена: заказ 94709764-0166-1й')
+        await review_tracker.mark_shown(test_db, doc)
+        applied = {**doc, 'new_comment': 'Лена: заказ 94709764-0166-1й.'}
+        await review_tracker.record_applied(test_db, applied)
+        after = _doc(comment='Лена: заказ 94709764-0166-1й.')
+        assert await review_tracker.filter_seen(test_db, [after]) == []
+
+    async def test_manual_edit_after_apply_reopens(self, test_db):
+        # но если текст изменили руками — документ снова доступен для ревью
+        doc = _doc(comment='аня частичная приемка')
+        await review_tracker.mark_shown(test_db, doc)
+        await review_tracker.record_applied(test_db, {**doc, 'new_comment': 'Аня: приёмка.'})
+        edited = _doc(comment='Аня: приёмка. Дописала причину руками.')
+        assert await review_tracker.filter_seen(test_db, [edited]) == [edited]
+
     async def test_applied_demand_clears_comment(self, test_db):
         d = _demand(comment='мусор', order_comment='Оля: ок.')
         await review_tracker.mark_shown(test_db, d)
