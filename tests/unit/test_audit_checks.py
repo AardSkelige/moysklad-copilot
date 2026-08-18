@@ -495,6 +495,32 @@ class TestEnterPriceSpread:
         assert [f.entity_name for f in found] == []
 
 
+class TestDeliveryAsPosition:
+    def _doc_with_delivery(self, doc_id, name, overhead=0):
+        return _doc('supply', doc_id, name, '2026-06-21 10:00:00', sum=1354000,
+                    overhead={'sum': overhead, 'distribution': 'price'},
+                    positions={'rows': [
+                        {'price': 139, 'quantity': 6000,
+                         'assortment': _product_meta('p1', 'БТМС (BTMS) 80%')},
+                        {'price': 100, 'quantity': 1000,
+                         'assortment': _product_meta('p2', 'Доставка (для закупок)')}]})
+
+    async def test_double_counted_delivery_exposed(self):
+        # Живой кейс 00051: доставка и позицией, и накладными расходами
+        from services.audit.checks.cross import DeliveryAsPositionCheck
+        ctx = FakeContext(FakeClient({'supply': [self._doc_with_delivery('s1', '00051', 100000)]}))
+        found = await DeliveryAsPositionCheck().detect(ctx, None)
+        assert len(found) == 1
+        assert found[0].payload['overhead_kopecks'] == 100000
+
+    async def test_delivery_without_overhead_marked(self):
+        # 00049: накладных нет — стоимость доставки не попала в себестоимость
+        from services.audit.checks.cross import DeliveryAsPositionCheck
+        ctx = FakeContext(FakeClient({'supply': [self._doc_with_delivery('s2', '00049')]}))
+        found = await DeliveryAsPositionCheck().detect(ctx, None)
+        assert found[0].payload['overhead_kopecks'] == 0
+
+
 class TestRetroEdit:
     async def test_detects_retro_edited_supply(self):
         # Живой кейс: приёмка 00025 от 01.04 исправлена 11.06 (+70 дней)
