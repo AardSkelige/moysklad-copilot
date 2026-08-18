@@ -665,6 +665,27 @@ class TestRetroEdit:
         assert found[0].payload['linked_documents'] == [
             'Заказ поставщику №00083 от 2026-08-12 на 2 000,00 ₽']
 
+    async def test_comment_edit_does_not_renew_fingerprint(self):
+        # Живой баг: ревью комментариев причесало комментарий приёмки 00085, у документа
+        # обновился updated — и уже разобранная находка пришла владельцу заново
+        check = RetroEditCheck()
+        supply = _doc('supply', 's8', '00085', '2026-08-12 12:32:00',
+                      updated='2026-08-14 14:50:00', created='2026-08-12 12:33:00')
+        events = [{'moment': '2026-08-14 14:50:37', 'eventType': 'update', 'uid': 'admin@x',
+                   'diff': {'positions': [{'newValue': {'assortment': {'name': 'Этикетка'},
+                                                        'quantity': 42.0, 'uom': 'шт',
+                                                        'price': 23.8}}]}}]
+        ctx = FakeContext(FakeClient({'supply': [supply]}, audit_events=events))
+        fp1 = fingerprint(check.id, (await check.detect(ctx, None))[0])
+
+        # бот поправил комментарий 18.08 — документ «изменился», но учёт не затронут
+        supply['updated'] = '2026-08-18 09:04:00'
+        events.insert(0, {'moment': '2026-08-18 09:04:00', 'eventType': 'update', 'uid': 'admin@x',
+                          'diff': {'description': {'oldValue': 'Яна приняла',
+                                                   'newValue': 'Яна: приняла.'}}})
+        fp2 = fingerprint(check.id, (await check.detect(ctx, None))[0])
+        assert fp1 == fp2   # тот же сигнал, повторного уведомления быть не должно
+
     async def test_fingerprint_new_on_another_day_edit(self):
         check = RetroEditCheck()
         supply = _doc('supply', 's1', '00025', '2026-04-01 10:00:00',

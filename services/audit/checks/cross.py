@@ -75,6 +75,17 @@ def is_cosmetic(events: list[dict]) -> bool:
         meaningful_fields(ev.get('diff') or {}) <= _COSMETIC_FIELDS for ev in events)
 
 
+def last_meaningful_moment(events: list[dict]) -> str | None:
+    """Момент последней правки, которая реально затронула учёт.
+
+    Отпечаток находки строится на этой дате, а не на `updated` документа: иначе
+    любое касание — включая правку комментария самим ревью комментариев — меняет
+    отпечаток, и уже разобранная находка приходит владельцу заново."""
+    moments = [(ev.get('moment') or '') for ev in events
+               if not (meaningful_fields(ev.get('diff') or {}) <= _COSMETIC_FIELDS)]
+    return max(moments) if moments else None
+
+
 def _position_line(change: dict) -> str:
     """Строка позиции из diff — по-человечески, а не обрезанным JSON.
 
@@ -175,6 +186,7 @@ class RetroEditCheck(CheckSpec):
                     continue
                 events = []
                 history_checked = False
+                salt_moment = d['updated'][:10]
                 if diffs_budget > 0:
                     try:
                         # интересуют только ПОЗДНИЕ правки: то, что доделали в первые
@@ -188,6 +200,7 @@ class RetroEditCheck(CheckSpec):
                         if is_cosmetic(raw_events):
                             continue   # переписали только комментарий — на учёт не влияет
                         events = _slim_audit_events(raw_events)
+                        salt_moment = (last_meaningful_moment(raw_events) or d['updated'])[:10]
                     except Exception:
                         pass
                 out.append(RawFinding(
@@ -208,7 +221,9 @@ class RetroEditCheck(CheckSpec):
                         # хотя её могли просто не запросить (лимит запросов за прогон)
                         'history_checked': history_checked,
                     },
-                    fingerprint_salt=d['updated'][:10],   # правка в другой день = новый сигнал
+                    # новый сигнал даёт только новая ЗНАЧИМАЯ правка: причёсанный
+                    # комментарий не должен присылать разобранную находку заново
+                    fingerprint_salt=salt_moment,
                 ))
         return out
 

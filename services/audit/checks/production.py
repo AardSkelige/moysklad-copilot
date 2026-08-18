@@ -7,7 +7,12 @@ productiontask не поддерживает filter=applicable (API отвеча
 from datetime import datetime, timedelta
 
 from core import config
-from services.audit.checks.cross import _slim_audit_events, events_after, meaningful_fields
+from services.audit.checks.cross import (
+    _slim_audit_events,
+    events_after,
+    last_meaningful_moment,
+    meaningful_fields,
+)
 from services.audit.context import AuditContext, format_moment, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
@@ -68,6 +73,7 @@ class ProductionRetroEditCheck(CheckSpec):
                 continue
             events = []
             history_checked = False
+            salt_moment = d['updated'][:10]
             if diffs_budget > 0:
                 try:
                     # как и для складских документов: правки в первые сутки — дозаполнение
@@ -80,6 +86,9 @@ class ProductionRetroEditCheck(CheckSpec):
                     if is_cosmetic(raw_events):
                         continue   # правили только комментарий/номер — учёт не затронут
                     events = _slim_audit_events(raw_events)
+                    # отпечаток — по последней значимой правке, иначе причёсанный
+                    # комментарий присылает разобранную находку заново
+                    salt_moment = (last_meaningful_moment(raw_events) or d['updated'])[:10]
                 except Exception:
                     pass
             out.append(RawFinding(
@@ -99,7 +108,7 @@ class ProductionRetroEditCheck(CheckSpec):
                     'changes_after_completion': events,
                     'history_checked': history_checked,
                 },
-                fingerprint_salt=d['updated'][:10],
+                fingerprint_salt=salt_moment,
             ))
         return out
 
