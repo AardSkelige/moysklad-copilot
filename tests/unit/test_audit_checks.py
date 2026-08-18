@@ -792,6 +792,44 @@ class TestCounterpartyBalance:
         # суммы в payload — в рублях: аналитик путался в конвертации копеек
         assert found[0].payload['paid_out_rub'] == 42140.0
 
+    async def test_commission_agent_debt_counts_sold_only(self):
+        # Живой кейс Каприоля: отгружено на реализацию 327 763 ₽, продано по отчёту
+        # комиссионера 78 680 ₽ — долгом является только проданное
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        agent = self._agent('cap', 'КСЦ Каприоль')
+        data = {
+            'demand': [_doc('demand', 'd1', '00100', '2026-07-01 10:00:00',
+                            sum=32776300, agent=agent)],
+            'contract': [{'id': 'c1', 'contractType': 'Commission',
+                          'agent': {'meta': {'href': f'{MS}/entity/counterparty/cap'}},
+                          'meta': {'href': f'{MS}/entity/contract/c1'}}],
+            'commissionreportin': [_doc('commissionreportin', 'r1', '00008',
+                                        '2026-07-28 10:00:00', sum=7868000, agent=agent)],
+        }
+        found = await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None)
+        assert len(found) == 1
+        p = found[0].payload
+        assert p['sold_by_commission_rub'] == 78680.0
+        assert p['goods_on_partner_shelf_rub'] == 249083.0
+        assert '78 680.00' in p['signals'][0]
+
+    async def test_commission_agent_settled_is_silent(self):
+        # продано по отчёту и оплачено — расхождения нет, хотя отгружено больше
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        agent = self._agent('cap2', 'ИП Комиссионер')
+        data = {
+            'demand': [_doc('demand', 'd1', '00101', '2026-07-01 10:00:00',
+                            sum=1975000, agent=agent)],
+            'contract': [{'id': 'c2', 'contractType': 'Commission',
+                          'agent': {'meta': {'href': f'{MS}/entity/counterparty/cap2'}},
+                          'meta': {'href': f'{MS}/entity/contract/c2'}}],
+            'commissionreportin': [_doc('commissionreportin', 'r2', '00009',
+                                        '2026-07-28 10:00:00', sum=854000, agent=agent)],
+            'paymentin': [_doc('paymentin', 'p1', '00050', '2026-07-29 10:00:00',
+                               sum=854000, agent=agent)],
+        }
+        assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
+
     async def test_marketplace_debt_is_not_a_problem(self):
         # Озон платит реестром за период — долг по отгрузкам выравнивается выплатой
         from services.audit.checks.money import CounterpartyBalanceCheck

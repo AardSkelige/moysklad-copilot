@@ -228,6 +228,26 @@ class CounterpartyBalanceCheck(CheckSpec):
         await _agent_sums('paymentin', 'paid_in', acc)
         await _agent_sums('cashin', 'paid_in', acc)
 
+        # Комиссионеры: отгрузка им — передача товара на реализацию, а не продажа.
+        # Долг возникает по мере продаж, которые фиксирует отчёт комиссионера
+        # (живой кейс: Каприолю отгружено 327 763 ₽, продано 78 680 ₽ — остальное
+        # лежит на его полке и нашим долгом не является).
+        commission_agents: set[str] = set()
+        for c in await ctx.cached_list('contract_all', 'contract', expand='agent', max_rows=500):
+            if (c.get('contractType') or '') != 'Commission':
+                continue
+            href = ((c.get('agent') or {}).get('meta') or {}).get('href', '')
+            if href:
+                commission_agents.add(href.split('?')[0])
+        sold_by_commission: dict[str, int] = {}
+        for r in await ctx.cached_list('commissionreportin_all', 'commissionreportin',
+                                       expand='agent', order='moment,desc', max_rows=1000):
+            if r.get('applicable') is False:
+                continue
+            href = ((r.get('agent') or {}).get('meta') or {}).get('href', '').split('?')[0]
+            if href:
+                sold_by_commission[href] = sold_by_commission.get(href, 0) + r.get('sum', 0)
+
         # Недопоставленные заказы поставщикам: «переплата», покрытая ожидаемой
         # поставкой, — это аванс, а не проблема (кейс Тара.ру: заказ «Заказано»,
         # оплачен, тара ещё едет)
@@ -282,7 +302,12 @@ class CounterpartyBalanceCheck(CheckSpec):
                 # (банк, подписки, доставка); взаиморасчёт по товарам не применим
                 continue
             supplier_balance = s['paid_out'] - s['supplies']   # >0 — переплатили поставщику
-            customer_balance = s['demands'] - s['paid_in']     # >0 — нам должны
+            on_commission = href in commission_agents or href in sold_by_commission
+            sold = sold_by_commission.get(href, 0)
+            # у комиссионера продажей считается отчёт, а не отгрузка
+            customer_base = sold if on_commission else s['demands']
+            customer_balance = customer_base - s['paid_in']     # >0 — нам должны
+            on_shelf = s['demands'] - sold if on_commission else 0
             awaiting = sum(p['awaiting_kopecks'] for p in pending_orders.get(href, []))
             problems = []
             if s['supplies'] or s['paid_out']:
@@ -320,6 +345,9 @@ class CounterpartyBalanceCheck(CheckSpec):
                     'paid_out_rub': round(s['paid_out'] / 100, 2),
                     'demands_rub': round(s['demands'] / 100, 2),
                     'paid_in_rub': round(s['paid_in'] / 100, 2),
+                    'on_commission': on_commission,
+                    'sold_by_commission_rub': round(sold / 100, 2) if on_commission else None,
+                    'goods_on_partner_shelf_rub': round(on_shelf / 100, 2) if on_commission else None,
                     'recent_docs': s['docs'][:15],
                     'open_purchase_orders': [
                         {'order': p['order'],
@@ -336,7 +364,10 @@ class CounterpartyBalanceCheck(CheckSpec):
                              'Долг покупателя, покрытый открытым заказом в статусе '
                              'ожидания оплаты или с договорённостью о постоплате '
                              'в комментарии, — норма, если договорённость свежая; '
-                             'давний долг без движения — повод напомнить покупателю.'),
+                             'давний долг без движения — повод напомнить покупателю. '
+                             'Для комиссионера (on_commission) долгом считается только '
+                             'проданное по отчётам комиссионера; goods_on_partner_shelf_rub — '
+                             'наш товар у него на реализации, это НЕ долг и не потеря.'),
                 },
                 # изменение баланса = новый сигнал; стабильный — молчит после ack
                 fingerprint_salt=f'{supplier_balance}|{customer_balance}',
