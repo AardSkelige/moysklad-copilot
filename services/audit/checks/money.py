@@ -117,7 +117,9 @@ class CounterpartyBalanceCheck(CheckSpec):
     default_severity = Severity.IMPORTANT
     supports_incremental = False   # баланс — агрегат, не инкремент
 
-    _BALANCE_THRESHOLD_KOPECKS = 100   # расхождения до 1 ₽ не сигналим
+    # хвосты от округлений и копеечные недоплаты (44 ₽ при обороте 22 тыс.)
+    # только зашумляют: значимым считаем расхождение от 100 ₽
+    _BALANCE_THRESHOLD_KOPECKS = 10000
 
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
         async def _agent_sums(entity: str, key: str, acc: dict):

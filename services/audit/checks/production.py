@@ -7,11 +7,23 @@ productiontask не поддерживает filter=applicable (API отвеча
 from datetime import datetime, timedelta
 
 from core import config
-from services.audit.checks.cross import _slim_audit_events, events_after, is_cosmetic
+from services.audit.checks.cross import _slim_audit_events, events_after, meaningful_fields
 from services.audit.context import AuditContext, format_moment, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 _DONE_STATES = {'готово'}
+
+# у ПЗ статус — часть рабочего процесса («выполнение» → «готово»), на остатки
+# и себестоимость он не влияет: их двигает состав материалов и выпуска
+_HARMLESS_FIELDS = {'description', 'name', 'state'}
+
+
+def is_cosmetic(events: list[dict]) -> bool:
+    """Все правки ПЗ — комментарий, номер или статус."""
+    return bool(events) and all(
+        meaningful_fields(ev.get('diff') or {}) <= _HARMLESS_FIELDS for ev in events)
+
+
 _MAX_AUDIT_DIFFS = 300   # см. комментарий в cross.py: без истории отсев косметики не работает
 
 

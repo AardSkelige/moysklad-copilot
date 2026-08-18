@@ -495,6 +495,42 @@ class TestEnterPriceSpread:
         assert [f.entity_name for f in found] == []
 
 
+class TestRootProduct:
+    def _product(self, pid, name, code='', folder_id=None):
+        d = {'id': pid, 'name': name, 'code': code,
+             'meta': {'href': f'{MS}/entity/product/{pid}', 'type': 'product'}}
+        if folder_id:
+            d['productFolder'] = {'meta': {'href': f'{MS}/entity/productfolder/{folder_id}'}}
+        return d
+
+    async def test_product_in_root_detected(self):
+        # Живой кейс: «Пробники тары» с кодом 0 в корне справочника
+        from services.audit.checks.products import RootProductCheck
+        data = {'product': [self._product('p1', 'Пробники тары', '0'),
+                            self._product('p2', 'Флакон 50 мл', '4-022', folder_id='f1')],
+                'productfolder': [{'id': 'f1', 'name': 'Тара',
+                                   'meta': {'href': f'{MS}/entity/productfolder/f1'}}]}
+        found = await RootProductCheck().detect(FakeContext(FakeClient(data)), None)
+        assert len(found) == 1
+        assert found[0].entity_name == 'Пробники тары'
+        # аналитику подсказываем существующие папки с их схемой кодов
+        assert found[0].payload['folders_available'] == ['Тара (коды 4-xxx)']
+
+    async def test_products_in_folders_silent(self):
+        from services.audit.checks.products import RootProductCheck
+        data = {'product': [self._product('p2', 'Флакон 50 мл', '4-022', folder_id='f1')],
+                'productfolder': [{'id': 'f1', 'name': 'Тара',
+                                   'meta': {'href': f'{MS}/entity/productfolder/f1'}}]}
+        assert await RootProductCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+    async def test_archived_root_product_ignored(self):
+        from services.audit.checks.products import RootProductCheck
+        prod = self._product('p3', 'Старый товар', '0')
+        prod['archived'] = True
+        data = {'product': [prod], 'productfolder': []}
+        assert await RootProductCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+
 class TestDeliveryAsPosition:
     def _doc_with_delivery(self, doc_id, name, overhead=0):
         return _doc('supply', doc_id, name, '2026-06-21 10:00:00', sum=1354000,

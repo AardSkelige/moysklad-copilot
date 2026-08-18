@@ -226,6 +226,70 @@ class FifoZeroCheck(CheckSpec):
                 'Всё, что производится из этого товара, получит заниженную себестоимость.')
 
 
+class RootProductCheck(CheckSpec):
+    """Товар лежит в корне справочника, без папки.
+
+    Папка задаёт тип товара (сырьё, тара, этикетки, готовая продукция) и схему
+    кодов: 1-xxx сырьё, 2-xxx продукция, 3-xxx этикетки, 4-xxx тара, 5-xxx хозтовары.
+    Товар без папки выпадает из отчётов по группам, и код ему обычно тоже
+    не присваивают — живой кейс: «Пробники тары» с кодом 0."""
+
+    id = 'product_without_folder'
+    section = Section.PRODUCTS
+    title = 'Товар заведён без папки'
+    default_severity = Severity.WARNING
+    supports_incremental = False
+
+    async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
+        products = await ctx.cached_list(
+            'products_all', 'product', order='updated,desc', max_rows=2000)
+        folders = {f['id']: f for f in await ctx.cached_list(
+            'productfolders_all', 'productfolder', max_rows=500)}
+        # какие коды в ходу у каждой папки — чтобы подсказать правильный префикс
+        prefixes: dict[str, set] = {}
+        for p in products:
+            folder = p.get('productFolder')
+            code = (p.get('code') or '').strip()
+            if folder and '-' in code:
+                fid = folder['meta']['href'].split('/')[-1]
+                prefixes.setdefault(fid, set()).add(code.split('-')[0])
+
+        out = []
+        for p in products:
+            if p.get('productFolder') or p.get('archived'):
+                continue
+            out.append(RawFinding(
+                entity_type='product',
+                entity_id=p['id'],
+                entity_href=p['meta']['href'],
+                entity_name=p.get('name', '?'),
+                severity=self.default_severity,
+                payload={
+                    'product': p.get('name'),
+                    'code': (p.get('code') or '').strip() or None,
+                    'article': p.get('article'),
+                    'uom': ((p.get('uom') or {}).get('name')),
+                    'description': (p.get('description') or '')[:200],
+                    'folders_available': sorted(
+                        f"{f['name']} (коды {'/'.join(sorted(prefixes.get(fid, {'—'})))}-xxx)"
+                        for fid, f in folders.items() if prefixes.get(fid)),
+                    'note': ('Товар не отнесён ни к одной папке справочника. Папка задаёт '
+                             'тип товара и схему кодов; без неё товар выпадает из отчётов '
+                             'по группам. Предложи подходящую папку из folders_available '
+                             'по смыслу названия и код с её префиксом.'),
+                },
+                fingerprint_salt='',
+                ui_link=(p.get('meta') or {}).get('uuidHref', ''),
+            ))
+        return out
+
+    def explain(self, payload: dict) -> str:
+        code = payload.get('code')
+        return (f'Товар «{payload.get("product")}» лежит в корне справочника'
+                + (f' с кодом {code}' if code else ' без кода')
+                + '. Нужно положить в папку по типу товара и присвоить код по её схеме.')
+
+
 class FifoDeviationCheck(CheckSpec):
     """Текущий FIFO товара заметно расходится с ценой его последней приёмки.
 

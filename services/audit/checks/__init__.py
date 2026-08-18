@@ -3,7 +3,11 @@ from services.audit.checks.money import (
     CounterpartyBalanceCheck, PaymentDuplicateCheck, PaymentNoClosingDocsCheck,
 )
 from services.audit.checks.production import ProductionRetroEditCheck, ProductionStuckCheck
-from services.audit.checks.products import FifoDeviationCheck, FifoZeroCheck
+from services.audit.checks.products import (
+    FifoDeviationCheck,
+    FifoZeroCheck,
+    RootProductCheck,
+)
 from services.audit.checks.purchases import OrderSupplyMismatchCheck, SupplyZeroPriceCheck
 from services.audit.checks.sales import (
     DemandNoOverheadCheck, DemandOverheadPaymentCheck, DemandZeroCheck,
@@ -35,6 +39,7 @@ def build_registry() -> list[CheckSpec]:
         NegativeStockCheck(),
         FifoZeroCheck(),
         FifoDeviationCheck(),
+        RootProductCheck(),
         DemandZeroCheck(),
         DemandNoOverheadCheck(),
         DemandOverheadPaymentCheck(),
