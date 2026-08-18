@@ -11,6 +11,7 @@ from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 _DEVIATION_CRITICAL = 0.50    # >50% — похоже на ошибку единиц измерения (кг вместо г и т.п.)
 _DEVIATION_IMPORTANT = 0.15   # 15–50% — рост цены/накладные, стоит взглянуть
+_MAX_BATCH_REPORTS = 60       # запрос партий только по кандидатам, их единицы
 
 # Маркеры бесплатного поступления в комментарии документа-источника: этикетки от
 # типографии, образцы от технолога, упаковка «взял в ХБ». Для них ноль — норма,
@@ -60,6 +61,23 @@ def _payment_state(doc: dict) -> str:
     return 'не оплачен'
 
 
+def _with_overhead(price: int | float, doc: dict) -> float:
+    """Цена позиции + её доля накладных расходов приёмки.
+
+    МойСклад распределяет накладные (доставку) на себестоимость позиций, поэтому
+    FIFO товара законно выше цены в документе. Сравнивать FIFO с голой ценой —
+    значит каждый раз находить расхождение, которого нет: у вазелина «отклонение
+    52%» оказалось ровно долей доставки в приёмке.
+
+    Распределение по цене (distribution='price') — доля пропорциональна сумме позиций.
+    """
+    overhead = (doc.get('overhead') or {}).get('sum', 0) or 0
+    positions_sum = doc.get('sum', 0) or 0
+    if overhead <= 0 or positions_sum <= 0:
+        return float(price)   # копейки бывают дробными: вода стоит 2,5 коп/г
+    return price * (1 + overhead / positions_sum)
+
+
 async def _last_supply_prices(ctx: AuditContext) -> dict[str, dict]:
     """href товара -> цена из самой свежей приёмки за окно сканирования."""
     docs = await ctx.cached_list(
@@ -76,6 +94,9 @@ async def _last_supply_prices(ctx: AuditContext) -> dict[str, dict]:
             if href and href not in out:
                 out[href] = {
                     'price_kopecks': p.get('price', 0),
+                    # с накладными: именно эту величину и показывает FIFO
+                    'cost_with_overhead_kopecks': _with_overhead(p.get('price', 0), d),
+                    'overhead_kopecks': (d.get('overhead') or {}).get('sum', 0) or 0,
                     'supply': d.get('name'),
                     'moment': (d.get('moment') or '')[:10],
                     'comment': (d.get('description') or '')[:200],
@@ -196,6 +217,7 @@ class FifoDeviationCheck(CheckSpec):
         last = await _last_supply_prices(ctx)
         sources, ui_links = await _product_source_docs(ctx)
         out = []
+        batches_budget = _MAX_BATCH_REPORTS
         for r in rows:
             if r.get('stock', 0) <= 0:
                 continue
@@ -206,9 +228,25 @@ class FifoDeviationCheck(CheckSpec):
             ls = last.get(href)
             if not ls or ls['price_kopecks'] <= 0:
                 continue
-            deviation = abs(fifo - ls['price_kopecks']) / ls['price_kopecks']
+            # сравниваем с ценой ПЛЮС накладные: FIFO их уже включает, и без этого
+            # доля доставки читается как «расхождение себестоимости»
+            baseline = ls.get('cost_with_overhead_kopecks') or ls['price_kopecks']
+            deviation = abs(fifo - baseline) / baseline
             if deviation < _DEVIATION_IMPORTANT:
                 continue
+            # остаток из нескольких партий: FIFO — их средневзвешенная, и отличие
+            # от цены последней приёмки ничего не значит (живой кейс лауроилглутамата:
+            # 4999 г по 0,53 ₽ и 1000 г по 2,20 ₽ дают ровно те 0,81 ₽, что в отчёте)
+            batches = []
+            if batches_budget > 0:
+                try:
+                    batches = await ctx.client.stock_batches(ctx.session, href.split('/')[-1])
+                    batches_budget -= 1
+                except Exception:
+                    batches = []
+            if len(batches) > 1:
+                continue
+
             severity = (Severity.CRITICAL if deviation >= _DEVIATION_CRITICAL
                         else Severity.IMPORTANT)
             out.append(RawFinding(
@@ -225,11 +263,16 @@ class FifoDeviationCheck(CheckSpec):
                     'fifo_kopecks': fifo,
                     'stock_value_kopecks': round(fifo * r.get('stock', 0)),
                     'last_supply': ls,
+                    'compared_with_kopecks': baseline,
+                    'stock_batches': len(batches),
                     'deviation_percent': round(deviation * 100, 1),
                     'source_documents': sources.get(href, [])[:6],
-                    'note': ('Отклонение >50% обычно означает ошибку в приёмке '
+                    'note': ('Отклонение уже посчитано ОТ ЦЕНЫ С НАКЛАДНЫМИ '
+                             '(compared_with_kopecks): доля доставки в себестоимость '
+                             'входит, объяснять расхождение накладными расходами больше '
+                             'нельзя. Отклонение >50% обычно означает ошибку в приёмке '
                              '(единицы измерения, лишний ноль); 15–50% — рост цены '
-                             'или накладные расходы. ЧИТАЙ комментарии документов-'
+                             'или старые партии на складе. ЧИТАЙ комментарии документов-'
                              'источников: бесплатные партии в истории объясняют '
                              'заниженный FIFO без чьей-либо ошибки. Поле payment '
                              'у источника — проверка версии «опечатка в цене»: '

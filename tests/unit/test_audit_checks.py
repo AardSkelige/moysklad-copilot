@@ -34,10 +34,11 @@ def _doc(entity, doc_id, name, moment, updated=None, applicable=True, **extra):
 class FakeClient:
     """Канированные ответы вместо API. data: {entity: [rows]}."""
 
-    def __init__(self, data=None, stock=None, audit_events=None):
+    def __init__(self, data=None, stock=None, audit_events=None, batches=None):
         self.data = data or {}
         self.stock = stock or []
         self.audit_events = audit_events or []
+        self.batches = batches or {}
 
     async def list_entities(self, session, entity, **kwargs):
         return self.data.get(entity, [])
@@ -50,6 +51,9 @@ class FakeClient:
 
     async def entity_audit_events(self, session, entity, entity_id):
         return self.audit_events
+
+    async def stock_batches(self, session, product_id):
+        return self.batches.get(product_id, [])
 
 
 class FakeContext:
@@ -936,6 +940,49 @@ class TestFifoChecks:
         client = FakeClient({'supply': []},
                             stock=[self._stock_row('p1', 'Этикетка', 0, 0)])
         assert await FifoZeroCheck().detect(FakeContext(client), None) == []
+
+    async def test_multiple_batches_explain_deviation(self):
+        # Живой кейс лауроилглутамата: 4999 г по 0,53 ₽ и 1000 г по 2,20 ₽ дают
+        # средневзвешенные 0,81 ₽ — расхождение с последней приёмкой мнимое
+        from services.audit.checks.products import FifoDeviationCheck
+        supply = _doc('supply', 's9', '00079', '2026-08-05 10:00:00', sum=650000,
+                      positions={'rows': [
+                          {'price': 170, 'quantity': 1000,
+                           'assortment': _product_meta('p9', 'Лауроилглутамат натрия, 95%')}]})
+        client = FakeClient(
+            {'supply': [supply]},
+            stock=[self._stock_row('p9', 'Лауроилглутамат натрия, 95%', 81, 5999)],
+            batches={'p9': [{'stock': 4999, 'costPerUnit': 53},
+                            {'stock': 1000, 'costPerUnit': 219.69}]},
+        )
+        assert await FifoDeviationCheck().detect(FakeContext(client), None) == []
+
+    async def test_overhead_share_is_not_a_deviation(self):
+        # Живой кейс вазелина: FIFO выше цены позиции ровно на долю доставки
+        # (накладные 375 ₽ при сумме позиций 720 ₽) — расхождения нет
+        from services.audit.checks.products import FifoDeviationCheck
+        supply = _doc('supply', 's1', '00077', '2026-08-04 10:00:00',
+                      sum=72000, overhead={'sum': 37500, 'distribution': 'price'},
+                      positions={'rows': [
+                          {'price': 72, 'quantity': 1000,
+                           'assortment': _product_meta('p1', 'Вазелин медицинский')}]})
+        client = FakeClient({'supply': [supply]},
+                            stock=[self._stock_row('p1', 'Вазелин медицинский', 109, 865)])
+        assert await FifoDeviationCheck().detect(FakeContext(client), None) == []
+
+    async def test_deviation_beyond_overhead_still_flagged(self):
+        # Та же приёмка, но FIFO вдвое выше цены с накладными — это уже сигнал
+        from services.audit.checks.products import FifoDeviationCheck
+        supply = _doc('supply', 's2', '00077', '2026-08-04 10:00:00',
+                      sum=72000, overhead={'sum': 37500, 'distribution': 'price'},
+                      positions={'rows': [
+                          {'price': 72, 'quantity': 1000,
+                           'assortment': _product_meta('p2', 'Вазелин медицинский')}]})
+        client = FakeClient({'supply': [supply]},
+                            stock=[self._stock_row('p2', 'Вазелин медицинский', 220, 865)])
+        found = await FifoDeviationCheck().detect(FakeContext(client), None)
+        assert len(found) == 1
+        assert round(found[0].payload['compared_with_kopecks']) == 110
 
     async def test_deviation_over_50_percent_critical(self):
         from services.audit.checks.products import FifoDeviationCheck

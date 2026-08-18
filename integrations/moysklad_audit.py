@@ -8,6 +8,7 @@ from typing import AsyncIterator
 
 import aiohttp
 
+from core import config
 from integrations.moysklad_base import MoySkladHTTP, encode_filter
 
 _EXPAND_PAGE_LIMIT = 100   # при expand МС ограничивает страницу сотней
@@ -65,6 +66,20 @@ class MoySkladAuditClient:
         data = await self.http.get(
             session, '/report/stock/bystore',
             f'limit=1000&filter={encode_filter("stockMode=negativeOnly")}',
+        )
+        return (data or {}).get('rows', [])
+
+    async def stock_batches(
+        self, session: aiohttp.ClientSession, product_id: str
+    ) -> list[dict]:
+        """Партии FIFO, из которых сложен текущий остаток товара.
+
+        Отчёт «Остатки по документам»: строка на партию с costPerUnit. Пока партий
+        больше одной, себестоимость остатка законно отличается от цены последней
+        приёмки — это средневзвешенная, а не цена последнего документа."""
+        data = await self.http.get(
+            session, '/report/byoperations/stock',
+            f'filter={encode_filter(f"assortment={config.MOYSKLAD_BASE_URL}/entity/product/{product_id}")}',
         )
         return (data or {}).get('rows', [])
 
