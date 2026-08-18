@@ -1,6 +1,6 @@
 """Проверки раздела «Деньги»: дубли платежей."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
 from services.audit.context import AuditContext, format_moment, is_marketplace, parse_moment
@@ -97,6 +97,79 @@ class PaymentDuplicateCheck(CheckSpec):
         n = len(payload.get('payments', []))
         return (f'{n} проведённых платежа одному контрагенту на одинаковую сумму — '
                 f'возможен дубль, деньги могли уйти дважды.')
+
+
+class DuplicateCounterpartyCheck(CheckSpec):
+    """Две карточки одного контрагента: одинаковый ИНН или одинаковое имя.
+
+    Документы расходятся по двум карточкам, и баланс контрагента перестаёт
+    сходиться в обе стороны. Живой кейс: Озон завели второй раз, и за день
+    на новую карточку ушло шесть заказов на 61 600 ₽, пока 190 документов
+    висели на основной."""
+
+    id = 'duplicate_counterparty'
+    section = Section.MONEY
+    title = 'Дубль контрагента в справочнике'
+    default_severity = Severity.IMPORTANT
+    supports_incremental = False
+
+    async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
+        agents = await ctx.cached_list('counterparty_all', 'counterparty', max_rows=2000)
+        active = [a for a in agents if not a.get('archived')]
+
+        groups: dict[tuple, list] = defaultdict(list)
+        for a in active:
+            inn = (a.get('inn') or '').strip()
+            key = ('инн', inn) if inn else ('имя', (a.get('name') or '').strip().lower())
+            if key[1]:
+                groups[key].append(a)
+
+        # сколько документов на каждой карточке — показывает, какая основная
+        usage: Counter = Counter()
+        for entity in ('supply', 'demand', 'customerorder', 'purchaseorder',
+                       'paymentin', 'paymentout', 'cashin', 'cashout'):
+            for d in await ctx.cached_list(f'{entity}_balance_full', entity,
+                                           expand='agent', order='moment,desc', max_rows=2000):
+                href = ((d.get('agent') or {}).get('meta') or {}).get('href', '')
+                if href:
+                    usage[href.split('/')[-1].split('?')[0]] += 1
+
+        out = []
+        for (kind, value), items in groups.items():
+            if len(items) < 2:
+                continue
+            cards = sorted(({
+                'name': a.get('name'),
+                'inn': (a.get('inn') or '').strip() or None,
+                'created': (a.get('created') or '')[:10],
+                'documents': usage.get(a['id'], 0),
+            } for a in items), key=lambda c: -c['documents'])
+            main = items[0]
+            out.append(RawFinding(
+                entity_type='counterparty',
+                entity_id=main['id'],
+                entity_href=main['meta']['href'],
+                entity_name=f'{main.get("name")} — {len(items)} карточки',
+                severity=self.default_severity,
+                payload={
+                    'match_by': 'ИНН' if kind == 'инн' else 'название',
+                    'value': value,
+                    'cards': cards,
+                    'note': ('Документы одного контрагента разошлись по разным карточкам: '
+                             'баланс, взаиморасчёты и история покупок считаются по каждой '
+                             'отдельно. Исправление: перенести документы на карточку, где '
+                             'их больше, и убрать вторую в архив.'),
+                },
+                fingerprint_salt='|'.join(sorted(a['id'] for a in items)),
+                ui_link=(main.get('meta') or {}).get('uuidHref', ''),
+            ))
+        return out
+
+    def explain(self, payload: dict) -> str:
+        cards = payload.get('cards', [])
+        counts = ' и '.join(f'{c["documents"]} док.' for c in cards)
+        return (f'Контрагент заведён дважды (совпадает {payload.get("match_by")}): '
+                f'{counts}. Баланс и взаиморасчёты разъезжаются.')
 
 
 class CounterpartyBalanceCheck(CheckSpec):

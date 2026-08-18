@@ -729,6 +729,45 @@ class TestOverheadPaymentMatching:
         assert await DemandOverheadPaymentCheck().detect(ctx, None) == []
 
 
+class TestDuplicateCounterparty:
+    def _agent(self, aid, name, inn='', created='2026-02-24 10:00:00', archived=False):
+        return {'id': aid, 'name': name, 'inn': inn, 'created': created,
+                'archived': archived,
+                'meta': {'href': f'{MS}/entity/counterparty/{aid}', 'type': 'counterparty'}}
+
+    async def test_same_inn_detected(self):
+        # Живой кейс: Озон заведён дважды с одним ИНН, документы разошлись
+        from services.audit.checks.money import DuplicateCounterpartyCheck
+        data = {'counterparty': [
+            self._agent('a1', 'ООО "ИНТЕРНЕТ РЕШЕНИЯ"', '7704217370'),
+            self._agent('a2', 'ООО "Интернет решения"', '7704217370', created='2026-08-17 10:00:00'),
+        ]}
+        found = await DuplicateCounterpartyCheck().detect(FakeContext(FakeClient(data)), None)
+        assert len(found) == 1
+        assert found[0].payload['match_by'] == 'ИНН'
+
+    async def test_archived_duplicate_ignored(self):
+        # объединённый дубль уже в архиве — сигнала быть не должно
+        from services.audit.checks.money import DuplicateCounterpartyCheck
+        data = {'counterparty': [
+            self._agent('a1', 'ООО "ЛАДОГА ПЛЮС"', '7805274783'),
+            self._agent('a2', 'ООО "ЛАДОГА ПЛЮС"', '7805274783', archived=True),
+        ]}
+        assert await DuplicateCounterpartyCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+    async def test_same_name_without_inn_detected(self):
+        from services.audit.checks.money import DuplicateCounterpartyCheck
+        data = {'counterparty': [self._agent('a1', 'ТК Байкал'), self._agent('a2', 'ТК Байкал')]}
+        found = await DuplicateCounterpartyCheck().detect(FakeContext(FakeClient(data)), None)
+        assert found[0].payload['match_by'] == 'название'
+
+    async def test_different_agents_silent(self):
+        from services.audit.checks.money import DuplicateCounterpartyCheck
+        data = {'counterparty': [self._agent('a1', 'Лемун', '111'),
+                                 self._agent('a2', 'Полицвет', '222')]}
+        assert await DuplicateCounterpartyCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+
 class TestCounterpartyBalance:
     def _agent(self, href='a1', name='ХИМТОРГ ПРИМЕР'):
         return {'name': name, 'meta': {'href': f'{MS}/entity/counterparty/{href}'}}

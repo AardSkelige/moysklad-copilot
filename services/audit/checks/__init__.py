@@ -1,5 +1,6 @@
 from services.audit.checks.cross import DeliveryAsPositionCheck, RetroEditCheck, StaleDocsCheck
 from services.audit.checks.money import (
+    DuplicateCounterpartyCheck,
     CounterpartyBalanceCheck, PaymentDuplicateCheck, PaymentNoClosingDocsCheck,
 )
 from services.audit.checks.production import ProductionRetroEditCheck, ProductionStuckCheck
@@ -33,6 +34,7 @@ def build_registry() -> list[CheckSpec]:
         OrderSupplyMismatchCheck(),
         PaymentDuplicateCheck(),
         CounterpartyBalanceCheck(),
+        DuplicateCounterpartyCheck(),
         PaymentNoClosingDocsCheck(),
         DeliveryAsPositionCheck(),
         EnterPriceVsFifoCheck(),
