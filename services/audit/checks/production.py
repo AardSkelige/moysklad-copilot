@@ -7,6 +7,7 @@ productiontask не поддерживает filter=applicable (API отвеча
 from datetime import datetime, timedelta
 
 from core import config
+from core.logger import logger
 from services.audit.checks.cross import (
     _slim_audit_events,
     events_after,
@@ -90,7 +91,10 @@ class ProductionRetroEditCheck(CheckSpec):
                     # комментарий присылает разобранную находку заново
                     salt_moment = (last_meaningful_moment(raw_events) or d['updated'])[:10]
                 except Exception:
-                    pass
+                    # без истории обосновать находку нечем — отложим до следующего скана
+                    logger.warning(f'[audit] история ПЗ {d["id"]} не получена, '
+                                   f'ретро-правку отложил', exc_info=True)
+                    continue
             out.append(RawFinding(
                 entity_type='productiontask',
                 entity_id=d['id'],

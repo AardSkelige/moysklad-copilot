@@ -20,6 +20,7 @@ from services.audit.analyst import AuditAnalyst
 from services.audit.context import AuditContext
 from services.audit.specs import CheckSpec, RawFinding, Severity, fingerprint
 from shared import session_scope
+from integrations.moysklad_base import new_session
 
 
 # служебные части карточки — не факты, вердикт от них не зависит
@@ -62,7 +63,7 @@ class AuditRunner:
         error_text = None
 
         try:
-            async with aiohttp.ClientSession() as http_session:
+            async with new_session() as http_session:
                 ctx = AuditContext(client, http_session)
                 for check in self.checks:
                     if since is not None and not check.supports_incremental:

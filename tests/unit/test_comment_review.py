@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from services.audit.comment_review import apply_demand, review_documents
+from services.audit.comment_review import (apply_demand, needs_final_dot,
+                                           review_documents, review_finance_documents)
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit, pytest.mark.audit]
 
@@ -77,12 +78,85 @@ class TestReviewDocuments:
         assert await review_documents([_doc()], llm=llm) == []
 
 
+    async def test_empty_comment_not_invented(self):
+        # пустое поле — норма: пересказ полей документа комментарием не является
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'verdict': 'suggest',
+            'new_comment': 'Аня: приёмка от ХИМТОРГ ПРИМЕР на 17570.00 руб.',
+            'reason': 'пустой комментарий'}], ensure_ascii=False), 'tool_calls': []}])
+        assert await review_documents([_doc(comment='')], llm=llm) == []
+    async def test_author_name_never_replaced(self):
+        # заказ маркетплейса подписан Леной; правило зон ответственности ждёт Женю,
+        # но подпись — факт: правится всё остальное, имя остаётся
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'verdict': 'suggest',
+            'new_comment': 'Катя: отгрузка №87517655, заказ № 60505189377.',
+            'reason': 'автор по контрагенту'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_doc(entity='customerorder', doc_id='o9', label='Заказ покупателя №00232',
+                     comment='Ира: Отгрузка №87517655, Заказ № 60505189377')]
+        out = await review_documents(docs, llm=llm)
+        assert len(out) == 1
+        assert out[0]['new_comment'] == 'Ира: отгрузка №87517655, заказ № 60505189377.'
+    async def test_author_added_when_missing(self):
+        # там, где имени нет вовсе, подставить автора по-прежнему можно
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'verdict': 'suggest',
+            'new_comment': 'Аня: оплатила отдушку наличными.',
+            'reason': 'нет автора'}], ensure_ascii=False), 'tool_calls': []}])
+        out = await review_documents([_doc(comment='оплатила отдушку наличными')], llm=llm)
+        assert out[0]['new_comment'].startswith('Аня:')
+
+
 def _demand(doc_id='dm1', comment='', order_comment='', overhead=0.0, delivery=None):
     return {'entity': 'demand', 'id': doc_id, 'kind': 'demand',
             'label': 'Отгрузка №00030 от 2026-05-21', 'agent': 'Иванова Мария',
             'sum_rub': 0.0, 'comment': comment, 'overhead_rub': overhead,
             'delivery_method': delivery,
             'order_id': 'o1', 'order_name': '00032', 'order_comment': order_comment}
+
+    async def test_only_dot_goes_to_batch_not_card(self):
+        # правка «только точка» карточкой не показывается — она уходит в пакетную операцию
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'verdict': 'suggest',
+            'new_comment': 'Ира: заказ 52050099-0627-1.',
+            'reason': 'точка в конце'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_doc(entity='customerorder', comment='Ира: заказ 52050099-0627-1')]
+        assert await review_documents(docs, llm=llm) == []
+
+    async def test_dot_plus_real_fix_still_shown(self):
+        # если вместе с точкой правится что-то ещё, карточка остаётся
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'verdict': 'suggest',
+            'new_comment': 'Ира: заказ 52050099-0627-1.',
+            'reason': 'регистр и точка'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_doc(entity='customerorder', comment='Ира: Заказ 52050099-0627-1')]
+        assert len(await review_documents(docs, llm=llm)) == 1
+
+
+class TestReviewFinance:
+    @staticmethod
+    def _fin(purpose='Заказ поставщику № 00074', comment=''):
+        return {'kind': 'finance', 'entity': 'cashout', 'id': 'f1',
+                'label': 'РКО №00058', 'agent': 'ИП Пример', 'sum_rub': 3582.0,
+                'purpose': purpose, 'comment': comment, 'linked': ['Заказ поставщику № 00074']}
+
+    async def test_empty_comment_not_invented(self):
+        # комментарий из пустоты не сочиняем — он дублировал бы назначение платежа
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_purpose': None,
+            'new_comment': 'Аня: оплата по заказу поставщику № 00074.',
+            'reason': 'добавлен автор'}], ensure_ascii=False), 'tool_calls': []}])
+        assert await review_finance_documents([self._fin()], llm=llm) == []
+
+    async def test_empty_purpose_still_filled(self):
+        # назначение, в отличие от комментария, восстанавливается по привязкам платежа
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_purpose': 'Заказ поставщику № 00074',
+            'new_comment': None, 'reason': 'основание по привязке'},
+        ], ensure_ascii=False), 'tool_calls': []}])
+        out = await review_finance_documents([self._fin(purpose='')], llm=llm)
+        assert len(out) == 1
+        assert out[0]['new_purpose'] == 'Заказ поставщику № 00074'
 
 
 class TestReviewDemands:
@@ -261,3 +335,36 @@ class TestDemandGrace:
     def test_broken_moment_is_not_fresh(self):
         from services.audit.comment_review import _too_fresh
         assert _too_fresh(None) is False
+
+
+@pytest.mark.unit
+class TestNeedsFinalDot:
+    def test_missing_dot_after_name(self):
+        assert needs_final_dot('Ира: заказ 52050099-0627-1')
+
+    def test_dot_already_there(self):
+        assert not needs_final_dot('Ира: заказ 52050099-0627-1.')
+
+    def test_broken_format_is_not_a_dot_case(self):
+        # «Аня готовая пенка» нужна настоящая правка, а не механическая точка
+        assert not needs_final_dot('Аня готовая пенка')
+
+    def test_empty_comment(self):
+        assert not needs_final_dot('')
+
+
+@pytest.mark.unit
+class TestCollectReportsFailures:
+    async def test_failed_entity_reported(self, monkeypatch):
+        # МойСклад не ответил по части типов — сбор обязан сказать, по каким именно
+        from services.audit import comment_review as cr
+
+        async def boom(self, session, entity, **kw):
+            if entity == 'demand':
+                raise TimeoutError('Connection timeout')
+            return []
+
+        monkeypatch.setattr(cr.MoySkladAuditClient, 'list_entities', boom)
+        docs, failed = await cr.collect_documents(30)
+        assert docs == []
+        assert failed == ['Отгрузка']

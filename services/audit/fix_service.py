@@ -11,6 +11,7 @@ import aiohttp
 from core import config
 from core.logger import logger
 from integrations.moysklad_audit import MoySkladAuditClient
+from integrations.moysklad_base import new_session
 
 # Действия, которые агент вправе предложить. Всё остальное отклоняется на валидации.
 ALLOWED_ACTIONS = {
@@ -139,7 +140,7 @@ class ErrorFixService:
         if error:
             raise ValueError(error)
         results = []
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             for a in preview.actions:
                 action = a['action']
                 if action == 'create_payment':

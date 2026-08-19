@@ -28,6 +28,7 @@ from services.audit.team_context import (
     TEAM_CONTEXT,
 )
 from services.llm_service import LLMClient
+from integrations.moysklad_base import new_session
 
 ENTITIES = {
     'supply': 'Приёмка',
@@ -66,14 +67,17 @@ _STYLE = (
     'суммы и даты — переноси СИМВОЛ В СИМВОЛ. Ничего не отбрасывай и не «причёсывай»: '
     '«94709764-0166-1й» так и остаётся «94709764-0166-1й», «№ 00077 от 03.07.2026» '
     'не сокращается до «№ 00077». Это данные, а не стиль.\n'
-    f'6. Имя, которое УЖЕ написано в комментарии, — факт: сохраняй его дословно. '
-    f'НИКОГДА не меняй одно имя на другое, даже если по зоне ответственности или '
-    f'контрагенту ожидается кто-то иной: человек подписался сам, ему виднее. '
-    f'Подставляй автора ТОЛЬКО когда имени в комментарии нет вообще — по зоне '
-    f'ответственности и типу документа: приёмки, заказы поставщику, производство → '
-    f'{AUTHOR_PURCHASES}; заказы покупателей → {AUTHOR_SALES}, НО если контрагент '
+    f'6. ИМЯ В КОММЕНТАРИИ НЕПРИКОСНОВЕННО. Если текст начинается с имени, оно '
+    f'остаётся тем же самым — всегда, без единого исключения. Ни зона ответственности, '
+    f'ни контрагент, ни тип документа НЕ являются поводом заменить одно имя другим: '
+    f'человек подписался сам, и это факт, а не стиль. Замена имени — грубая ошибка, '
+    f'даже если по всем правилам компании ожидается кто-то иной. Разрешено только '
+    f'исправить написание того же имени ({", ".join(CANONICAL_NAMES)}).\n'
+    f'6a. Подставлять автора можно ТОЛЬКО в комментарий, где имени нет вообще. '
+    f'Тогда бери его по типу документа: приёмки, заказы поставщику, производство → '
+    f'{AUTHOR_PURCHASES}; заказы покупателей → {AUTHOR_SALES}, но при контрагенте '
     f'{MARKETPLACES} → {AUTHOR_MARKETPLACE}; платежи и финансы → {AUTHOR_FINANCE}. '
-    f'Только если тип документа не даёт определить — «⚠️ (автор?):».\n\n'
+    f'Если тип документа не даёт определить — «⚠️ (автор?):».\n\n'
     f'Эталонные примеры (следуй им буквально):\n'
     f'• «трек-номер СДЭКа - 10261902800» (заказ покупателя, частный покупатель) → '
     f'«{AUTHOR_SALES}: трек-номер СДЭК — 10261902800.»\n'
@@ -97,8 +101,10 @@ _SYSTEM = (
     'reason — одно короткое конкретное предложение, ЧТО исправлено '
     '(например «опечатка: кодней → кондиционер; точка в конце»). '
     'НИКОГДА не пиши бессмыслицу вида «оплата вместо оплата» или «X → X».\n'
-    'Если комментарий пуст — предложи фактический комментарий из данных документа '
-    '(тип, контрагент, сумма), без выдуманных причин; автора подставь по правилу 6 стиля.\n'
+    'Если комментарий ПУСТ — верни "ok". Пустое поле это норма: комментарий нужен '
+    'только там, где есть что сказать сверх самого документа. Пересказ полей '
+    '(тип документа, контрагент, сумма, склад) — не комментарий, а шум: всё это '
+    'владелец видит в документе. Никогда не сочиняй текст для пустого поля.\n'
     'НЕ выдумывай факты (причины, суммы, номера). Автор по зоне ответственности — '
     'не выдумка, а правило 6.\n\n'
     'Ответ — СТРОГО JSON-массив без markdown: '
@@ -177,15 +183,19 @@ def _too_fresh(moment: str | None) -> bool:
     return doc_moment > datetime.now() - timedelta(hours=config.AUDIT_DEMAND_GRACE_HOURS)
 
 
-async def collect_documents(days: int) -> list[dict]:
+async def collect_documents(days: int) -> tuple[list[dict], list[str]]:
     """Документы сгруппированы по типу (порядок ENTITIES), внутри — от старых к новым.
+
+    Возвращает (документы, названия несобравшихся типов). Второй список нужен,
+    чтобы владелец не увидел бодрое «все комментарии в порядке» после того, как
+    МойСклад не ответил: молчаливый успех на пустом наборе — худший из отчётов.
 
     days <= 0 — вся история без фильтра по дате."""
     client = MoySkladAuditClient()
     filters = (f'moment>={format_moment(datetime.now() - timedelta(days=days))}'
                if days > 0 else '')
-    docs = []
-    async with aiohttp.ClientSession() as session:
+    docs, failed = [], []
+    async with new_session() as session:
         for entity, label in ENTITIES.items():
             expand = 'agent,customerOrder' if entity == 'demand' else 'agent'
             try:
@@ -197,6 +207,7 @@ async def collect_documents(days: int) -> list[dict]:
                 )
             except Exception as e:
                 logger.warning(f'[comments] {entity} не собрался: {e}')
+                failed.append(label)
                 continue
             for d in rows:
                 doc = {
@@ -225,7 +236,7 @@ async def collect_documents(days: int) -> list[dict]:
                         'order_comment': (order.get('description') or '').strip(),
                     })
                 docs.append(doc)
-    return docs
+    return docs, failed
 
 
 async def review_documents(docs: list[dict], llm: LLMClient | None = None) -> list[dict]:
@@ -280,8 +291,16 @@ async def _review_generic(docs: list[dict], llm: LLMClient) -> list[dict]:
                 doc = batch[int(v['n'])]
             except (KeyError, ValueError, IndexError):
                 continue
+            new_comment = _keep_author(doc['comment'], new_comment)
+            # правка «только точка» уходит в пакетную операцию, не в карточку
+            if _only_final_dot(doc['comment'], new_comment):
+                continue
             # LLM иногда «предлагает» тот же текст — такие карточки бессмысленны
             if _normalized(new_comment) == _normalized(doc['comment']):
+                continue
+            # пустое поле — норма. Комментарий чиним, но не сочиняем: пересказ полей
+            # документа («приёмка от X на Y руб.») не несёт ничего сверх самого документа
+            if not doc['comment']:
                 continue
             suggestions.append({**doc, 'new_comment': new_comment,
                                 'reason': _short_reason(v.get('reason'))})
@@ -335,6 +354,10 @@ async def _review_demands(docs: list[dict], llm: LLMClient) -> list[dict]:
                     # СДЭК: единый сводный счёт — в пустую отгрузку ничего не пишем
                     new_comment = None
             new_order_comment = (v.get('new_order_comment') or '').strip() or None
+            if new_order_comment:
+                new_order_comment = _keep_author(doc['order_comment'], new_order_comment)
+            if new_order_comment and _only_final_dot(doc['order_comment'], new_order_comment):
+                new_order_comment = None
             # заказ только дополняем — очистку и «тот же текст» отбрасываем
             if new_order_comment and _normalized(new_order_comment) == _normalized(doc['order_comment']):
                 new_order_comment = None
@@ -353,7 +376,7 @@ async def _review_demands(docs: list[dict], llm: LLMClient) -> list[dict]:
 async def apply_demand(item: dict):
     """Записать до двух документов: комментарий отгрузки и/или связанного заказа."""
     client = MoySkladAuditClient()
-    async with aiohttp.ClientSession() as session:
+    async with new_session() as session:
         if item.get('new_comment') is not None:
             await client.update_entity(session, 'demand', item['id'],
                                        {'description': item['new_comment']})
@@ -398,15 +421,51 @@ async def refine_demand(item: dict, instruction: str, llm: LLMClient | None = No
         return item
     out = dict(item)
     if 'new_comment' in data and data['new_comment'] is not None:
-        out['new_comment'] = data['new_comment'].strip()
+        out['new_comment'] = _keep_author(item['comment'], data['new_comment'].strip())
     new_order_comment = (data.get('new_order_comment') or '').strip() or None
     if new_order_comment:
-        out['new_order_comment'] = new_order_comment
+        out['new_order_comment'] = _keep_author(item['order_comment'], new_order_comment)
     return out
 
 
 def _normalized(text: str) -> str:
     return ' '.join((text or '').lower().split())
+
+
+def _only_final_dot(current: str, proposed: str) -> bool:
+    """Правка сводится к точке в конце — карточка ради неё бессмысленна.
+
+    64 комментария за месяц отличались от стандарта только этим; каждый занимал
+    отдельную карточку с кнопками. Такие документы уходят в пакетную операцию."""
+    cur, new = (current or '').strip(), (proposed or '').strip()
+    return bool(cur) and cur != new and new == cur + '.'
+
+
+def needs_final_dot(text: str) -> bool:
+    """Комментарий написан по стандарту, но без точки в конце.
+
+    Формат «Имя: текст» обязателен: без него документу нужна настоящая правка
+    («Яна готовая пенка» → «Яна: готовая пенка.»), а не механическая точка,
+    иначе пачка допишет точку и оставит документ наполовину исправленным."""
+    t = (text or '').strip()
+    if not t or not _AUTHOR_RE.match(t):
+        return False
+    return not t.endswith(('.', '!', '?', ':', '…'))
+
+
+_AUTHOR_RE = re.compile(r'^\s*([А-ЯЁ][а-яё]+)\s*:')
+
+
+def _keep_author(current: str, proposed: str) -> str:
+    """Вернуть подпись автора из исходного текста, если LLM подменила её другим именем.
+
+    Правило 6 промпта запрещает менять имя, но модель нарушала его стабильно:
+    в заказах маркетплейсов «Лена» превращалась в «Женя» по зоне ответственности.
+    Откатываем только имя — остальная правка (регистр, точка, опечатки) остаётся."""
+    was, now = _AUTHOR_RE.match(current or ''), _AUTHOR_RE.match(proposed or '')
+    if not was or not now or was.group(1) == now.group(1):
+        return proposed
+    return proposed[:now.start(1)] + was.group(1) + proposed[now.end(1):]
 
 
 def _is_sdek(doc: dict) -> bool:
@@ -423,9 +482,53 @@ def _short_reason(reason: str | None) -> str:
     return (cut[:dot + 1] if dot > 100 else cut.rsplit(' ', 1)[0] + '…')
 
 
+async def collect_dot_fixes(days: int) -> list[dict]:
+    """Документы, которым не хватает только точки в конце — для пакетной правки.
+
+    Собирается кодом, без LLM: правило механическое, а спрашивать по одному
+    документу за точку — пустая трата внимания владельца."""
+    docs, _ = await collect_documents(days)
+    out = []
+    for d in docs:
+        for field, entity, entity_id, text in (
+            ('comment', d['entity'], d['id'], d['comment']),
+            ('order_comment', 'customerorder', d.get('order_id'), d.get('order_comment')),
+        ):
+            if not entity_id or not needs_final_dot(text):
+                continue
+            out.append({'entity': entity, 'id': entity_id,
+                        'label': d['label'] if field == 'comment'
+                                 else f'Заказ покупателя №{d.get("order_name")}',
+                        'comment': text, 'new_comment': text.strip() + '.'})
+    # заказ, связанный с двумя отгрузками, не должен попасть в список дважды
+    seen, unique = set(), []
+    for item in out:
+        key = (item['entity'], item['id'])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+async def apply_dot_fixes(items: list[dict]) -> int:
+    """Записать точки пачкой; вернуть число обновлённых документов."""
+    client = MoySkladAuditClient()
+    done = 0
+    async with new_session() as session:
+        for item in items:
+            try:
+                await client.update_entity(session, item['entity'], item['id'],
+                                           {'description': item['new_comment']})
+                done += 1
+            except Exception as e:
+                logger.warning(f'[comments] точка не записалась в {item["label"]}: {e}')
+    return done
+
+
 async def apply_comment(entity: str, entity_id: str, new_comment: str):
     client = MoySkladAuditClient()
-    async with aiohttp.ClientSession() as session:
+    async with new_session() as session:
         await client.update_entity(session, entity, entity_id,
                                    {'description': new_comment})
 
@@ -455,19 +558,32 @@ _FIN_SYSTEM = (
     'У каждого документа два поля:\n'
     '• НАЗНАЧЕНИЕ (paymentPurpose) — ссылка на основание платежа. Стандарт:\n'
     '  - доставка: «Доставка по приёмке № X»;\n'
+    '  - оплата поставщику по заказу: «Заказ поставщику № X» — если платёж связан '
+    'с заказом поставщику, основание именно заказ, а НЕ приёмка;\n'
     '  - покупка без заказа: «Приёмка № X»;\n'
     '  - оплата от покупателя: «Заказ покупателя № X»;\n'
     f'  - выплата маркетплейса: {FIN_PURPOSE_MARKETPLACE};\n'
     '  - наличные с выставки: «Розничные продажи, выставка [название] [дата]»;\n'
     '  - операционка: короткая категория («Аренда», «Банковские услуги», «Бухгалтерия»).\n'
     '  В поле «связанные_документы» даны привязки платежа — используй их для точного '
-    'основания. Если основание приходится УГАДЫВАТЬ (нет привязки) — начни назначение '
-    'с «⚠️ » (владелец проверит). Если определить нельзя — верни null.\n'
+    'основания. Знак «⚠️ » ставь ТОЛЬКО когда сам придумываешь основание и можешь '
+    'ошибиться. Уже написанное осмысленное назначение знаком не помечай: отсутствие '
+    'привязки само по себе не повод. Если определить нельзя — верни null.\n'
     f'• КОММЕНТАРИЙ (description) — «Имя: человеческое пояснение» по стилю: после '
     f'двоеточия СТРОЧНАЯ буква, точка в конце, опечатки исправлены. '
     f'Эталон: «{FIN_COMMENT_EXAMPLE}» '
     f'Автор финансовых документов чаще {AUTHOR_FINANCE}, закупочных платежей — '
     f'{AUTHOR_PURCHASES}.\n\n'
+    'РКО и оплата картой/наличными — это ЛИЧНЫЕ деньги того, кто подписался '
+    '(совладельцы платят своими, компенсации нет). Комментарий там обязан говорить, '
+    'чьи это деньги, и способ, если он указан в исходном тексте: «Яна: купила '
+    'на свои, наличными.», «Женя: оплатила доставку своими.». Что именно куплено '
+    'и по какому документу — не пиши, это видно в позициях и назначении.\n'
+    'Исходящий платёж с расчётного счёта — деньги компании, чьи они, писать не нужно.\n'
+    'Комментарий НЕ повторяет назначение: если сказать нечего сверх основания платежа, '
+    'верни new_comment=null. Пустой комментарий — норма, сочинять текст для него нельзя. '
+    'Комментарий нужен только для того, чего в документе не видно: чьи это деньги '
+    '(сотрудник платил своими), необычный способ оплаты, оплата за третье лицо.\n'
     'Если у документа поле «назначение_авто_не_менять» = true — назначение создано '
     'системой, для него всегда new_purpose=null; НЕ упоминай это в reason, слово '
     '«защищено» не используй — просто предлагай только комментарий.\n'
@@ -480,13 +596,15 @@ _FIN_SYSTEM = (
 )
 
 
-async def collect_finance_documents(days: int = 0) -> list[dict]:
-    """Финансовые документы с обоими полями и привязками. days<=0 — вся история."""
+async def collect_finance_documents(days: int = 0) -> tuple[list[dict], list[str]]:
+    """Финансовые документы с обоими полями и привязками. days<=0 — вся история.
+
+    Возвращает (документы, названия несобравшихся типов) — см. collect_documents."""
     client = MoySkladAuditClient()
     filters = (f'moment>={format_moment(datetime.now() - timedelta(days=days))}'
                if days > 0 else '')
-    docs = []
-    async with aiohttp.ClientSession() as session:
+    docs, failed = [], []
+    async with new_session() as session:
         for entity, label in FIN_ENTITIES.items():
             try:
                 rows = await client.list_entities(
@@ -497,6 +615,7 @@ async def collect_finance_documents(days: int = 0) -> list[dict]:
                 )
             except Exception as e:
                 logger.warning(f'[fin-comments] {entity} не собрался: {e}')
+                failed.append(label)
                 continue
             for d in rows:
                 linked = []
@@ -517,7 +636,7 @@ async def collect_finance_documents(days: int = 0) -> list[dict]:
                     'comment': (d.get('description') or '').strip(),
                     'linked': linked,
                 })
-    return docs
+    return docs, failed
 
 
 async def review_finance_documents(docs: list[dict], llm: LLMClient | None = None) -> list[dict]:
@@ -558,7 +677,15 @@ async def review_finance_documents(docs: list[dict], llm: LLMClient | None = Non
                 new_purpose = None
             if new_purpose and _normalized(new_purpose) == _normalized(doc['purpose']):
                 new_purpose = None
+            if new_comment:
+                new_comment = _keep_author(doc['comment'], new_comment)
+            if new_comment and _only_final_dot(doc['comment'], new_comment):
+                new_comment = None
             if new_comment and _normalized(new_comment) == _normalized(doc['comment']):
+                new_comment = None
+            # комментарий не сочиняем из пустоты — в отличие от назначения,
+            # которое восстанавливается по привязкам платежа
+            if new_comment and not doc['comment']:
                 new_comment = None
             if not new_purpose and not new_comment:
                 continue
@@ -577,7 +704,7 @@ async def apply_finance(item: dict):
     if not payload:
         return
     client = MoySkladAuditClient()
-    async with aiohttp.ClientSession() as session:
+    async with new_session() as session:
         await client.update_entity(session, item['entity'], item['id'], payload)
 
 
@@ -603,7 +730,7 @@ async def refine_comment(item: dict, instruction: str, llm: LLMClient | None = N
         }, ensure_ascii=False)},
     ])
     text = (resp.get('content') or '').strip().strip('«»"')
-    return text or item['new_comment']
+    return _keep_author(item['comment'], text) if text else item['new_comment']
 
 
 _FIN_REFINE_SYSTEM = (
@@ -645,5 +772,5 @@ async def refine_finance(item: dict, instruction: str, llm: LLMClient | None = N
         out['new_purpose'] = new_purpose
     new_comment = (data.get('new_comment') or '').strip() or None
     if new_comment:
-        out['new_comment'] = new_comment
+        out['new_comment'] = _keep_author(item['comment'], new_comment)
     return out

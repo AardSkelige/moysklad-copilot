@@ -567,6 +567,19 @@ class TestRetroEdit:
         assert len(found) == 1
         assert found[0].payload['gap_days'] > 69
 
+    async def test_unavailable_history_postpones_finding(self):
+        # audit API не ответил: что менялось — неизвестно, обосновать находку нечем.
+        # Живой кейс: массовая правка комментариев уронила запрос истории, и владелец
+        # получил «правили неизвестно что» по документу, где переписали один комментарий
+        class BrokenHistory(FakeClient):
+            async def entity_audit_events(self, session, entity, entity_id):
+                raise TimeoutError('audit API недоступен')
+
+        supply = _doc('supply', 's6', '00070', '2026-07-27 10:00:00',
+                      updated='2026-08-18 21:31:00', created='2026-07-27 10:00:00')
+        ctx = FakeContext(BrokenHistory({'supply': [supply]}))
+        assert await RetroEditCheck().detect(ctx, None) == []
+
     async def test_same_day_edit_ok(self):
         supply = _doc('supply', 's2', '00049', '2026-06-21 10:00:00',
                       updated='2026-06-21 18:00:00')

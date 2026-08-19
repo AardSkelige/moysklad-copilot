@@ -88,7 +88,7 @@ class MoySkladProductionClient:
         Старые позиции из EXCLUDED_PRODUCT_CODES исключаются."""
         out: dict[str, dict] = {}
         offset = 0
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             while True:
                 data = await self._get(s, '/entity/processingplan', {
                     'limit': 100, 'offset': offset, 'expand': 'products.assortment',
@@ -121,7 +121,7 @@ class MoySkladProductionClient:
         plans = await self.build_plans_map()
 
         # (a) МС-search
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             data = await self._get(s, '/entity/product', {
                 'search': query, 'limit': limit,
             })
@@ -158,7 +158,7 @@ class MoySkladProductionClient:
         out: dict[str, float] = {}
         store_href = f'{self.base}/entity/store/{config.MOYSKLAD_STORE_MATERIALS_ID}'
         offset = 0
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             while True:
                 data = await self._get(s, '/report/stock/all', {
                     'filter': f'store={store_href}', 'limit': 1000, 'offset': offset,
@@ -178,7 +178,7 @@ class MoySkladProductionClient:
         return: {material_id: {code, name, qty_needed}}
         """
         materials: dict[str, dict] = defaultdict(lambda: {'code': '', 'name': '', 'qty_needed': 0.0})
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             for plan_id, volume in plan_volumes.items():
                 data = await self._get(s, f'/entity/processingplan/{plan_id}/materials', {
                     'expand': 'assortment', 'limit': 100,
@@ -197,7 +197,7 @@ class MoySkladProductionClient:
 
     async def get_task_states_map(self) -> dict[str, str]:
         """Маппинг {имя статуса в нижнем регистре: state_id} для productiontask."""
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             data = await self._get(s, '/entity/productiontask/metadata')
         out = {}
         for st in data.get('states', []) or []:
@@ -214,7 +214,7 @@ class MoySkladProductionClient:
             variants.append(name.zfill(5))
         variants = list(dict.fromkeys(variants))  # uniq
 
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             for v in variants:
                 data = await self._get(s, '/entity/productiontask', {
                     'filter': f'name={v}', 'limit': 1, 'expand': 'state',
@@ -226,7 +226,7 @@ class MoySkladProductionClient:
 
     async def find_recent_tasks(self, limit: int = 5) -> list[dict]:
         """Последние N ПЗ (по убыванию moment)."""
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             data = await self._get(s, '/entity/productiontask', {
                 'order': 'moment,desc', 'limit': limit, 'expand': 'state',
             })
@@ -234,7 +234,7 @@ class MoySkladProductionClient:
 
     async def find_tasks_by_date_range(self, moment_from: str, moment_to: str, limit: int = 20) -> list[dict]:
         """ПЗ в диапазоне дат. Формат moment: 'YYYY-MM-DD HH:MM:SS'."""
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             data = await self._get(s, '/entity/productiontask', {
                 'filter': f'moment>={moment_from};moment<={moment_to}',
                 'order': 'moment,desc', 'limit': limit, 'expand': 'state',
@@ -243,13 +243,13 @@ class MoySkladProductionClient:
 
     async def get_task_by_id(self, task_id: str) -> dict:
         """Получить полное ПЗ по id вместе с раскрытым state."""
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             return await self._get(s, f'/entity/productiontask/{task_id}', {'expand': 'state'})
 
     async def get_task_rows(self, task_id: str) -> list[dict]:
         """Позиции ПЗ с раскрытым processingPlan и его products.assortment.
         Возвращает [{row_id, plan_id, plan_name, product_code, product_name, volume}]."""
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             data = await self._get(
                 s, f'/entity/productiontask/{task_id}/productionrows',
                 {'expand': 'processingPlan.products.assortment', 'limit': 100},
@@ -279,7 +279,7 @@ class MoySkladProductionClient:
         """POST новой позиции в ПЗ."""
         url = f'{self.base}/entity/productiontask/{task_id}/productionrows'
         payload = [{'processingPlan': _meta('processingplan', plan_id), 'productionVolume': volume}]
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             async with s.post(url, headers=_headers(), json=payload, ssl=_ssl_ctx()) as r:
                 if r.status not in (200, 201):
                     text = await r.text()
@@ -290,7 +290,7 @@ class MoySkladProductionClient:
         """PUT количества в существующей позиции."""
         url = f'{self.base}/entity/productiontask/{task_id}/productionrows/{row_id}'
         payload = {'productionVolume': volume}
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             async with s.put(url, headers=_headers(), json=payload, ssl=_ssl_ctx()) as r:
                 if r.status not in (200, 201):
                     text = await r.text()
@@ -300,7 +300,7 @@ class MoySkladProductionClient:
     async def delete_task_row(self, task_id: str, row_id: str) -> None:
         """DELETE позиции."""
         url = f'{self.base}/entity/productiontask/{task_id}/productionrows/{row_id}'
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             async with s.delete(url, headers=_headers(), ssl=_ssl_ctx()) as r:
                 if r.status not in (200, 204):
                     text = await r.text()
@@ -310,7 +310,7 @@ class MoySkladProductionClient:
         """PUT на ПЗ — только смена статуса."""
         url = f'{self.base}/entity/productiontask/{task_id}'
         payload = {'state': _meta('state', state_id)}
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             async with s.put(url, headers=_headers(), json=payload, ssl=_ssl_ctx()) as r:
                 if r.status not in (200, 201):
                     text = await r.text()
@@ -347,7 +347,7 @@ class MoySkladProductionClient:
             'deliveryPlannedMoment': delivery_planned_moment,
             'productionRows': rows,
         }
-        async with aiohttp.ClientSession() as s:
+        async with new_session() as s:
             result = await self._post(s, '/entity/productiontask', payload)
         logger.info(f"Created production task: {result.get('name')} ({result.get('id')})")
         return result

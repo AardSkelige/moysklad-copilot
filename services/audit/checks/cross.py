@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta
 
 from core import config
+from core.logger import logger
 from services.audit.context import AuditContext, format_moment, linked_documents, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
@@ -202,7 +203,12 @@ class RetroEditCheck(CheckSpec):
                         events = _slim_audit_events(raw_events)
                         salt_moment = (last_meaningful_moment(raw_events) or d['updated'])[:10]
                     except Exception:
-                        pass
+                        # без истории находка звучит как «что-то поменяли, что именно —
+                        # неизвестно»: обосновать её нечем, а владельца она будит.
+                        # Пропускаем документ — вернёмся к нему следующим сканом
+                        logger.warning(f'[audit] история {entity} {d["id"]} не получена, '
+                                       f'ретро-правку отложил', exc_info=True)
+                        continue
                 out.append(RawFinding(
                     entity_type=entity,
                     entity_id=d['id'],

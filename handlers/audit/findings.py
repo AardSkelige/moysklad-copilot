@@ -129,21 +129,17 @@ async def _dashboard_text() -> str:
             .order_by(AuditRun.finished_at.desc()).limit(1)
         )).scalar_one_or_none()
         pending = await _pending_count(db)
-        fixed = (await db.execute(
-            select(func.count()).where(Finding.status == FindingStatus.FIXED)
-        )).scalar_one()
     from core import config
     lines = ['🔍 <b>Аудит учёта МойСклад</b>\n']
     if last:
         lines.append(f'Последняя проверка: {last.finished_at:%d.%m %H:%M} '
-                     f'({"полная" if last.run_type == "full" else "быстрая"})')
+                     f'({_RUN_KIND.get(last.run_type, last.run_type)})')
     else:
         lines.append('Проверок ещё не было — запусти первую.')
-    lines.append(f'Неразобранных находок: <b>{pending}</b>')
-    if fixed:
-        lines.append(f'Исправлено через бота: {fixed}')
-    lines.append(f'\nСам проверяю каждые {config.AUDIT_INCREMENTAL_MINUTES} мин, '
-                 f'полностью — ежедневно в {config.AUDIT_FULL_HOUR}:00.')
+    lines.append(f'Ждут разбора: <b>{pending}</b>')
+    lines.append(f'\nПроверяю сам каждые {config.AUDIT_INCREMENTAL_MINUTES} мин — '
+                 f'смотрю, что изменилось с прошлого раза. '
+                 f'Раз в сутки в {config.AUDIT_FULL_HOUR}:00 перебираю всю базу целиком.')
     return '\n'.join(lines)
 
 
@@ -160,25 +156,15 @@ async def _status_text() -> str:
     lines = ['<b>Последние проверки:</b>']
     for r in runs:
         icon = {'ok': '✅', 'error': '❌'}.get(r.status, '⏳')
-        kind = 'полная' if r.run_type == 'full' else 'быстрая'
-        lines.append(f'{icon} {r.started_at:%d.%m %H:%M} — {kind}, '
+        lines.append(f'{icon} {r.started_at:%d.%m %H:%M} — '
+                     f'{_RUN_KIND.get(r.run_type, r.run_type)}, '
                      f'новых находок: {r.findings_new}')
-
+    # счётчики закрытого и «рассосалось само» показывали объём архива, который
+    # владельцу ни о чём не говорит: разобранное хранится ради дедупликации,
+    # чтобы те же находки не пришли заново, а не ради статистики
     pending = (counts.get(FindingStatus.NEW, 0)
                + counts.get(FindingStatus.NOTIFIED, 0))
-    closed = (counts.get(FindingStatus.IGNORED, 0)
-              + counts.get(FindingStatus.ACKNOWLEDGED, 0))
-    lines.append('\n<b>Находки за всё время:</b>')
-    lines.append(f'📬 Ждут твоего разбора: <b>{pending}</b>')
-    if counts.get(FindingStatus.FIXED):
-        lines.append(f'🛠 Исправлено через бота: {counts[FindingStatus.FIXED]}')
-    if closed:
-        lines.append(f'✅ Закрыто: {closed} (ты нажал «Ок» или ИИ посчитал нормой)')
-    if counts.get(FindingStatus.RESOLVED):
-        lines.append(f'🌱 Исчезли сами: {counts[FindingStatus.RESOLVED]} '
-                     f'(при перепроверке проблемы уже не было)')
-    if pending:
-        lines.append('\nРазобрать: «📋 Неразобранные находки» или /audit_findings')
+    lines.append(f'\n📬 Ждут разбора: <b>{pending}</b>')
     return '\n'.join(lines)
 
 
@@ -243,7 +229,8 @@ async def cmd_audit(message: Message):
 
 @router.message(Command('audit_status'))
 async def cmd_audit_status(message: Message):
-    await message.answer(await _status_text())
+    from shared.keyboards import audit_menu_keyboard
+    await message.answer(await _status_text(), reply_markup=audit_menu_keyboard())
 
 
 @router.message(Command('audit_findings'))
@@ -253,6 +240,8 @@ async def cmd_audit_findings(message: Message):
 
 
 _PENDING = (FindingStatus.NEW, FindingStatus.NOTIFIED)
+# «быстрая/полная» ничего не объясняли: непонятно, что именно проверяется
+_RUN_KIND = {'incremental': 'свежие изменения', 'full': 'вся база'}
 # порядок категорий в меню — как в списке разделов бота
 from services.audit.specs import Section  # noqa: E402
 
@@ -329,7 +318,7 @@ async def _show_one_finding(message: Message, sec_idx: int, section, offset: int
             await _show_one_finding(message, sec_idx, section, 0)
         else:
             await message.answer(f'В категории «{section.value}» всё разобрано 🎉')
-            await _show_sections(message)
+            await _show_sections(message)   # следом — категории или меню аудита
         return
     f = rows[0]
     nav = []

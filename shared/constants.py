@@ -66,6 +66,8 @@ class CallbackData:
     AUDIT_COMMENT_APPLY = 'aud_cmt_ok'
     AUDIT_COMMENT_SKIP = 'aud_cmt_skip'
     AUDIT_COMMENT_STOP = 'aud_cmt_stop'
+    AUDIT_COMMENT_DOTS = 'aud_cmt_dots'        # показать список «не хватает точки»
+    AUDIT_COMMENT_DOTS_GO = 'aud_cmt_dots_go'  # применить их пачкой
 
 
 class CallbackPrefix:

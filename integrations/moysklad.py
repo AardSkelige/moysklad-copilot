@@ -8,6 +8,7 @@ from typing import Optional
 from core import config
 from core.database import OperationType, DocumentSubtype, Category
 from core.logger import logger
+from integrations.moysklad_base import new_session
 
 
 class MoySkladClient:
@@ -115,7 +116,7 @@ class MoySkladClient:
 
         ssl_context = self._get_ssl_context()
 
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             async with session.post(
                 endpoint,
                 headers=self._get_headers(),
@@ -141,7 +142,7 @@ class MoySkladClient:
 
         ssl_context = self._get_ssl_context()
 
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             async with session.delete(
                 endpoint,
                 headers=self._get_headers(),
@@ -164,7 +165,7 @@ class MoySkladClient:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             async with session.get(
                 endpoint,
                 headers=self._get_headers(),
@@ -192,7 +193,7 @@ class MoySkladClient:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             async with session.put(
                 href,
                 headers=self._get_headers(),
@@ -215,7 +216,7 @@ class MoySkladClient:
 
         ssl_context = self._get_ssl_context()
 
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             async with session.get(
                 endpoint,
                 headers=self._get_headers(),
@@ -249,7 +250,7 @@ class MoySkladClient:
 
         ssl_context = self._get_ssl_context()
 
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             async with session.post(
                 endpoint,
                 headers=self._get_headers(),
@@ -292,7 +293,7 @@ class MoySkladClient:
             ('cashout', OperationType.EXPENSE),
         ]:
             endpoint = f'{self.base_url}/entity/{entity_type}'
-            async with aiohttp.ClientSession() as session:
+            async with new_session() as session:
                 async with session.get(
                     endpoint,
                     headers=self._get_headers(),
@@ -329,7 +330,7 @@ class MoySkladClient:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             async with session.put(
                 href,
                 headers=self._get_headers(),
@@ -348,7 +349,7 @@ class MoySkladClient:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
-        async with aiohttp.ClientSession() as session:
+        async with new_session() as session:
             async with session.delete(
                 href,
                 headers=self._get_headers(),

@@ -14,6 +14,7 @@ from services.audit.fix_service import FixPreview, validate_actions
 from services.audit.humanize import humanize_money
 from services.audit.team_context import SPEAK_RULES, TEAM_CONTEXT
 from services.llm_service import LLMClient
+from integrations.moysklad_base import new_session
 
 TOOLS = [
     {
@@ -297,7 +298,7 @@ class FixAgent:
         client = MoySkladAuditClient()
 
         async def get_document(args):
-            async with aiohttp.ClientSession() as s:
+            async with new_session() as s:
                 d = await client.http.get(
                     s, f'/entity/{args["entity_type"]}/{args["entity_id"]}', 'expand=agent,state')
             if d is None:
@@ -305,7 +306,7 @@ class FixAgent:
             return json.dumps(_slim_document(d), ensure_ascii=False), None
 
         async def get_positions(args):
-            async with aiohttp.ClientSession() as s:
+            async with new_session() as s:
                 rows = await client.get_positions(s, args['entity_type'], args['entity_id'])
             slim = [{
                 'position_id': p.get('id'),
@@ -316,7 +317,7 @@ class FixAgent:
             return json.dumps({'positions': slim}, ensure_ascii=False), None
 
         async def get_audit_events(args):
-            async with aiohttp.ClientSession() as s:
+            async with new_session() as s:
                 events = await client.entity_audit_events(s, args['entity_type'], args['entity_id'])
             return json.dumps({'events': _slim_audit_events(events, limit=8)},
                               ensure_ascii=False), None
@@ -409,7 +410,7 @@ class FixAgent:
             name = (args.get('name') or '').strip()
             if not name:
                 return json.dumps({'error': 'Пустое название'}, ensure_ascii=False), None
-            async with aiohttp.ClientSession() as s:
+            async with new_session() as s:
                 rows = await client.list_entities(
                     s, 'counterparty', filters=f'name~{name}', max_rows=8)
             out = [{'name': r.get('name'), 'agent_href': (r.get('meta') or {}).get('href')}
@@ -417,7 +418,7 @@ class FixAgent:
             return json.dumps({'counterparties': out}, ensure_ascii=False), None
 
         async def list_expense_items(args):
-            async with aiohttp.ClientSession() as s:
+            async with new_session() as s:
                 rows = await client.list_entities(s, 'expenseitem', max_rows=50)
             out = [{'name': r.get('name'),
                     'expense_item_href': (r.get('meta') or {}).get('href')}

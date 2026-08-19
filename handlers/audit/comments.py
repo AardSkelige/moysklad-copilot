@@ -13,9 +13,9 @@ from core import config
 from core.logger import logger
 from services.audit import review_tracker
 from services.audit.comment_review import (
-    apply_comment, apply_demand, apply_finance, collect_documents,
-    collect_finance_documents, refine_comment, refine_demand, refine_finance,
-    review_documents, review_finance_documents,
+    apply_comment, apply_demand, apply_dot_fixes, apply_finance, collect_documents,
+    collect_dot_fixes, collect_finance_documents, refine_comment, refine_demand,
+    refine_finance, review_documents, review_finance_documents,
 )
 from shared import session_scope
 from shared.constants import CallbackData, CallbackPrefix
@@ -35,6 +35,8 @@ _MENU_EXPLAIN = (
     'остальное бот предложит перенести в связанный заказ.\n'
     '💰 <b>Финансы</b> — платежи, ПКО/РКО. Проверяются два поля: '
     'назначение платежа и комментарий.\n\n'
+    '📍 <b>Расставить точки</b> — комментарии, которым не хватает только точки '
+    'в конце. Отдельными карточками они не показываются: правится пачкой.\n\n'
     'Выбери набор и период:'
 )
 
@@ -51,6 +53,8 @@ def _period_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f'💰 Финансы · {days} дн.', callback_data=f'{go}fin:{days}'),
             InlineKeyboardButton(text='💰 Финансы · вся история', callback_data=f'{go}fin:0'),
         ],
+        [InlineKeyboardButton(text='📍 Расставить точки',
+                              callback_data=CallbackData.AUDIT_COMMENT_DOTS)],
         [InlineKeyboardButton(text='◀️ Назад', callback_data=CallbackData.AUDIT_MENU)],
     ])
 
@@ -153,8 +157,8 @@ async def on_comments_start(callback: CallbackQuery, state: FSMContext):
         f'{"несколько минут" if days > 0 else "это займёт заметное время"}…'
     )
     try:
-        docs = await (collect_finance_documents(days) if is_finance
-                      else collect_documents(days))
+        docs, failed = await (collect_finance_documents(days) if is_finance
+                              else collect_documents(days))
         # документ, показанный дважды и не изменившийся, больше не предлагаем
         async with session_scope() as session:
             docs = await review_tracker.filter_seen(session, docs)
@@ -162,15 +166,28 @@ async def on_comments_start(callback: CallbackQuery, state: FSMContext):
                              else review_documents(docs))
     except Exception as e:
         logger.exception('comment review failed')
-        await progress.edit_text(f'❌ Не получилось: {e}')
+        await progress.edit_text(f'❌ Не получилось: {e}',
+                                 reply_markup=_period_keyboard())
         return
     try:
         await progress.delete()
     except Exception:
         pass
+    if failed:
+        # молчаливое «всё в порядке» после обрыва связи — худший из отчётов:
+        # владелец решит, что проверка прошла, а её не было
+        await callback.message.answer(
+            '⚠️ МойСклад не отдал часть документов: ' + ', '.join(failed) +
+            '.\nЭти типы НЕ проверены — стоит повторить позже.')
+    if not failed and not suggestions:
+        await callback.message.answer(
+            f'Проверил {len(docs)} документов — все комментарии в порядке 🎉',
+            reply_markup=_period_keyboard())
+        return
     if not suggestions:
         await callback.message.answer(
-            f'Проверил {len(docs)} документов — все комментарии в порядке 🎉')
+            f'В собранных документах ({len(docs)}) правок не нашлось.',
+            reply_markup=_period_keyboard())
         return
     await state.set_state(AuditState.reviewing_comments)
     await state.set_data({'cmt_queue': suggestions, 'cmt_idx': 0,
@@ -282,3 +299,51 @@ async def on_comment_stop(callback: CallbackQuery, state: FSMContext):
         f'👋 Закончили: заменено {applied}, оставлено {skipped}.',
         reply_markup=audit_menu_keyboard(),
     )
+
+
+@router.callback_query(F.data == CallbackData.AUDIT_COMMENT_DOTS)
+async def on_dots_preview(callback: CallbackQuery, state: FSMContext):
+    """Список документов, которым не хватает только точки в конце."""
+    await callback.answer()
+    progress = await callback.message.answer('📍 Ищу комментарии без точки…')
+    try:
+        items = await collect_dot_fixes(config.AUDIT_COMMENT_REVIEW_DAYS)
+    except Exception as e:
+        logger.exception('dot fixes collect failed')
+        await progress.edit_text(f'❌ Не получилось: {e}',
+                                 reply_markup=_period_keyboard())
+        return
+    if not items:
+        await progress.edit_text('Все комментарии заканчиваются точкой 🎉',
+                                 reply_markup=_period_keyboard())
+        return
+    await state.update_data(cmt_dots=items)
+    shown = '\n'.join(f'• {i["label"]} — {i["comment"][:60]}' for i in items[:15])
+    tail = f'\n… и ещё {len(items) - 15}' if len(items) > 15 else ''
+    await progress.edit_text(
+        f'📍 <b>{len(items)} документов без точки в конце</b>\n\n{shown}{tail}\n\n'
+        f'Поставить точку везде?',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='✏️ Поставить точки',
+                                 callback_data=CallbackData.AUDIT_COMMENT_DOTS_GO),
+            InlineKeyboardButton(text='👌 Не надо', callback_data=CallbackData.AUDIT_COMMENTS),
+        ]]),
+    )
+
+
+@router.callback_query(F.data == CallbackData.AUDIT_COMMENT_DOTS_GO)
+async def on_dots_apply(callback: CallbackQuery, state: FSMContext):
+    """Записать точки во все собранные документы."""
+    await callback.answer()
+    items = (await state.get_data()).get('cmt_dots') or []
+    if not items:
+        await callback.message.answer('Список устарел — собери заново.',
+                                      reply_markup=_period_keyboard())
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    progress = await callback.message.answer(f'⏳ Ставлю точки: {len(items)} документов…')
+    done = await apply_dot_fixes(items)
+    await state.update_data(cmt_dots=[])
+    from shared.keyboards import audit_menu_keyboard
+    await progress.edit_text(f'✅ Точки поставлены: {done} из {len(items)}.',
+                             reply_markup=audit_menu_keyboard())

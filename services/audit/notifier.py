@@ -146,16 +146,13 @@ class AuditNotifier:
                 select(func.count()).where(Finding.status.in_(
                     (FindingStatus.NEW, FindingStatus.NOTIFIED)))
             )).scalar_one()
-            resolved_recently = (await db.execute(
-                select(func.count()).where(Finding.status == FindingStatus.RESOLVED)
-            )).scalar_one()
         lines = ['🌅 <b>Ночная проверка учёта завершена</b>\n']
         lines.append('Новых проблем не найдено 🎉' if new_count == 0
                      else f'Новых находок: <b>{new_count}</b> (прислал выше)')
         if pending:
             lines.append(f'Ждут разбора: {pending} — /audit_findings')
-        if resolved_recently:
-            lines.append(f'Закрылись сами за всё время: {resolved_recently}')
+        # счётчик «закрылись сами» из сводки убран: владельцу нечего с ним делать,
+        # а число росло из прогона в прогон и выглядело как незакрытый долг
         try:
             await self.bot.send_message(self.owner_id, '\n'.join(lines))
         except Exception as e:
