@@ -8,6 +8,14 @@ from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
 _DUPLICATE_WINDOW_DAYS = 14
 
+# статусы заказа, при которых оплата не аванс, а деньги к возврату
+_CANCELLED_ORDER_MARKERS = ('отмен', 'возврат')
+
+
+def _is_cancelled_order(status: str) -> bool:
+    low = (status or '').lower()
+    return any(m in low for m in _CANCELLED_ORDER_MARKERS)
+
 
 def _within_window(sorted_docs: list) -> list:
     """Оставить самую большую группу платежей, попарно ближе окна друг к другу."""
@@ -270,11 +278,16 @@ class CounterpartyBalanceCheck(CheckSpec):
                     'awaiting_kopecks': remaining,
                 })
 
-        # Недоплаченные заказы покупателей: долг при заказе в статусе ожидания
-        # оплаты / с договорённостью о постоплате в комментарии — норма (кейс
-        # Александровой: заказ «Ждем оплату», «оплата будет после 10го»).
-        # Кодом не подавляем — судит LLM по статусу, комментарию и давности.
+        # Заказы покупателей в работе. Недоплата — возможный долг: при статусе
+        # ожидания оплаты / договорённости о постоплате в комментарии это норма
+        # (кейс Александровой: «Ждем оплату», «оплата будет после 10го»), кодом
+        # не подавляем — судит LLM. А оплаченная и ещё не отгруженная часть —
+        # аванс под заказ, и это норма симметрично авансу поставщику (кейс
+        # Медведевой: заказ 00221 оплачен 23 250 ₽, статус «Можно собирать»,
+        # отгрузки пока нет — деньги на балансе покрыты заказом).
+        # Отменённый заказ авансом не считаем: такие деньги подлежат возврату.
         pending_customer: dict[str, list] = {}
+        prepaid_unshipped: dict[str, int] = {}
         customer_orders = await ctx.cached_list(
             'customerorder_balance_full', 'customerorder',
             expand='agent,state', order='moment,desc', max_rows=2000,
@@ -282,18 +295,26 @@ class CounterpartyBalanceCheck(CheckSpec):
         for o in customer_orders:
             if o.get('applicable') is False:
                 continue
-            unpaid = o.get('sum', 0) - o.get('payedSum', 0)
-            if unpaid <= 0:
+            order_sum = o.get('sum', 0)
+            payed, shipped = o.get('payedSum') or 0, o.get('shippedSum') or 0
+            unpaid = order_sum - payed
+            prepaid = min(payed, order_sum) - shipped   # оплачено, но не отгружено
+            if unpaid <= 0 and prepaid <= 0:
                 continue
             agent = o.get('agent') if isinstance(o.get('agent'), dict) else None
             href = ((agent or {}).get('meta') or {}).get('href', '')
-            if href:
-                pending_customer.setdefault(href, []).append({
-                    'order': f'Заказ покупателя №{o.get("name")} от {(o.get("moment") or "")[:10]}',
-                    'awaiting_payment_rub': round(unpaid / 100, 2),
-                    'status': ((o.get('state') or {}).get('name')) or None,
-                    'comment': (o.get('description') or '')[:200],
-                })
+            if not href:
+                continue
+            status = ((o.get('state') or {}).get('name')) or ''
+            if prepaid > 0 and not _is_cancelled_order(status):
+                prepaid_unshipped[href] = prepaid_unshipped.get(href, 0) + prepaid
+            pending_customer.setdefault(href, []).append({
+                'order': f'Заказ покупателя №{o.get("name")} от {(o.get("moment") or "")[:10]}',
+                'awaiting_payment_rub': round(max(unpaid, 0) / 100, 2),
+                'paid_awaiting_shipment_rub': round(max(prepaid, 0) / 100, 2),
+                'status': status or None,
+                'comment': (o.get('description') or '')[:200],
+            })
 
         out = []
         for href, s in acc.items():
@@ -319,11 +340,15 @@ class CounterpartyBalanceCheck(CheckSpec):
                         ('переплата поставщику' if supplier_balance > 0
                          else 'приёмки не оплачены') +
                         f': {abs(supplier_balance) / 100:,.2f} ₽'.replace(',', ' '))
+            awaiting_shipment = prepaid_unshipped.get(href, 0)
             if s['demands'] or s['paid_in']:
                 if (customer_balance > 0 and is_marketplace(s['agent'])):
                     # маркетплейс платит реестром за период: долг по отгрузкам
                     # выравнивается следующей выплатой — это не потерянные деньги
                     pass
+                elif (customer_balance < 0 and not on_commission
+                        and -customer_balance <= awaiting_shipment + self._BALANCE_THRESHOLD_KOPECKS):
+                    pass   # предоплата под открытый заказ покупателя — норма
                 elif abs(customer_balance) > self._BALANCE_THRESHOLD_KOPECKS:
                     problems.append(
                         ('покупатель не доплатил' if customer_balance > 0
@@ -355,12 +380,16 @@ class CounterpartyBalanceCheck(CheckSpec):
                         for p in pending_orders.get(href, [])[:5]
                     ],
                     'open_customer_orders': pending_customer.get(href, [])[:5],
+                    'paid_awaiting_shipment_rub': round(awaiting_shipment / 100, 2),
                     'note': ('Все суммы в этих данных УЖЕ В РУБЛЯХ. '
                              'Баланс рассчитан по всей истории документов. '
                              'Для поставщика долг = исходящие платежи меньше приёмок; '
                              'для покупателя = входящие платежи меньше отгрузок. '
                              'Не путай направление платежей в объяснении. '
                              'Переплата при открытом заказе поставщику = аванс (норма). '
+                             'Полученное сверх отгруженного, покрытое оплаченным и ещё '
+                             'не отгруженным заказом покупателя (paid_awaiting_shipment_rub), '
+                             '= предоплата под заказ, тоже норма. '
                              'Долг покупателя, покрытый открытым заказом в статусе '
                              'ожидания оплаты или с договорённостью о постоплате '
                              'в комментарии, — норма, если договорённость свежая; '
