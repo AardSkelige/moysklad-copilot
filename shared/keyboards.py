@@ -40,6 +40,14 @@ def audit_menu_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
+def audit_findings_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка разбора находок — сообщения бота ведут кнопкой, а не текстом команды."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=ButtonLabel.AUDIT_LIST, callback_data=CallbackData.AUDIT_LIST)],
+        [InlineKeyboardButton(text=ButtonLabel.BACK, callback_data=CallbackData.AUDIT_MENU)],
+    ])
+
+
 def production_confirm_keyboard(action_label: str = '✅ Создать') -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [

@@ -17,6 +17,7 @@ from core.logger import logger
 from services.audit.specs import SEVERITY_EMOJI, Severity, web_link
 from shared import session_scope
 from shared.constants import CallbackPrefix
+from shared.keyboards import audit_findings_keyboard
 
 
 def finding_keyboard(finding_id: int, nav_rows: list | None = None) -> InlineKeyboardMarkup:
@@ -126,10 +127,11 @@ class AuditNotifier:
                  if is_baseline else '🧾 <b>Аудит: новые находки</b>\n')
         text = (
             f'{title}\n' + '\n'.join(lines) +
-            f'\n\nВсего: {len(findings)}. Разбор по одной: /audit_findings'
+            f'\n\nВсего: {len(findings)}'
         )
         try:
-            await self.bot.send_message(self.owner_id, text)
+            await self.bot.send_message(self.owner_id, text,
+                                        reply_markup=audit_findings_keyboard())
             async with session_scope() as db:
                 for f in findings:
                     row = await db.get(Finding, f.id)
@@ -150,11 +152,13 @@ class AuditNotifier:
         lines.append('Новых проблем не найдено 🎉' if new_count == 0
                      else f'Новых находок: <b>{new_count}</b> (прислал выше)')
         if pending:
-            lines.append(f'Ждут разбора: {pending} — /audit_findings')
+            lines.append(f'Ждут разбора: <b>{pending}</b>')
         # счётчик «закрылись сами» из сводки убран: владельцу нечего с ним делать,
         # а число росло из прогона в прогон и выглядело как незакрытый долг
         try:
-            await self.bot.send_message(self.owner_id, '\n'.join(lines))
+            await self.bot.send_message(
+                self.owner_id, '\n'.join(lines),
+                reply_markup=audit_findings_keyboard() if pending else None)
         except Exception as e:
             logger.warning(f'[audit] сводка не отправилась: {e}')
 

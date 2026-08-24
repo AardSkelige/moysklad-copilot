@@ -254,6 +254,8 @@ async def on_exit_dialog(callback: CallbackQuery, state: FSMContext):
     current = await state.get_state()
     if current and current.startswith('AuditState'):
         await state.clear()
-    await callback.message.answer('👋 Закончили. Находка остаётся в списке (/audit_findings).')
+    from shared.keyboards import audit_findings_keyboard
+    await callback.message.answer('👋 Закончили. Находка остаётся в списке.',
+                                  reply_markup=audit_findings_keyboard())
 
 # /cancel обрабатывается глобально в handlers/common.py
