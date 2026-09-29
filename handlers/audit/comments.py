@@ -13,8 +13,10 @@ from core import config
 from core.logger import logger
 from services.audit import review_tracker
 from services.audit.comment_review import (
-    apply_comment, apply_demand, apply_dot_fixes, apply_finance, collect_documents,
-    collect_dot_fixes, collect_finance_documents, refine_comment, refine_demand,
+    DEMAND_MARKETPLACE_ZERO_COMMENT,
+    apply_comment, apply_demand, apply_dot_fixes, apply_finance, apply_marketplace_zero_fixes,
+    collect_documents, collect_dot_fixes, collect_finance_documents,
+    collect_marketplace_zero_fixes, refine_comment, refine_demand,
     refine_finance, review_documents, review_finance_documents,
 )
 from shared import session_scope
@@ -37,6 +39,8 @@ _MENU_EXPLAIN = (
     'назначение платежа и комментарий.\n\n'
     '📍 <b>Расставить точки</b> — комментарии, которым не хватает только точки '
     'в конце. Отдельными карточками они не показываются: правится пачкой.\n\n'
+    '📦 <b>Отгрузки маркетплейсов</b> — отгрузки Ozon/ПМТ/Яндекс.Маркету с нулевыми '
+    'накладными и пустым комментарием: ставит стандартную фразу пачкой, без карточек.\n\n'
     'Выбери набор и период:'
 )
 
@@ -55,6 +59,8 @@ def _period_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text='📍 Расставить точки',
                               callback_data=CallbackData.AUDIT_COMMENT_DOTS)],
+        [InlineKeyboardButton(text='📦 Отгрузки маркетплейсов',
+                              callback_data=CallbackData.AUDIT_COMMENT_MP)],
         [InlineKeyboardButton(text='◀️ Назад', callback_data=CallbackData.AUDIT_MENU)],
     ])
 
@@ -346,4 +352,52 @@ async def on_dots_apply(callback: CallbackQuery, state: FSMContext):
     await state.update_data(cmt_dots=[])
     from shared.keyboards import audit_menu_keyboard
     await progress.edit_text(f'✅ Точки поставлены: {done} из {len(items)}.',
+                             reply_markup=audit_menu_keyboard())
+
+
+@router.callback_query(F.data == CallbackData.AUDIT_COMMENT_MP)
+async def on_mp_preview(callback: CallbackQuery, state: FSMContext):
+    """Список пустых отгрузок маркетплейсов с нулевыми накладными."""
+    await callback.answer()
+    progress = await callback.message.answer('📦 Ищу пустые отгрузки маркетплейсов…')
+    try:
+        items = await collect_marketplace_zero_fixes(config.AUDIT_COMMENT_REVIEW_DAYS)
+    except Exception as e:
+        logger.exception('marketplace zero fixes collect failed')
+        await progress.edit_text(f'❌ Не получилось: {e}',
+                                 reply_markup=_period_keyboard())
+        return
+    if not items:
+        await progress.edit_text('Пустых отгрузок маркетплейсов нет 🎉',
+                                 reply_markup=_period_keyboard())
+        return
+    await state.update_data(cmt_mp=items)
+    shown = '\n'.join(f'• {i["label"]}' for i in items[:15])
+    tail = f'\n… и ещё {len(items) - 15}' if len(items) > 15 else ''
+    await progress.edit_text(
+        f'📦 <b>{len(items)} отгрузок без комментария</b>\n\n{shown}{tail}\n\n'
+        f'Поставить «{DEMAND_MARKETPLACE_ZERO_COMMENT}» везде?',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='✏️ Проставить всем',
+                                 callback_data=CallbackData.AUDIT_COMMENT_MP_GO),
+            InlineKeyboardButton(text='👌 Не надо', callback_data=CallbackData.AUDIT_COMMENTS),
+        ]]),
+    )
+
+
+@router.callback_query(F.data == CallbackData.AUDIT_COMMENT_MP_GO)
+async def on_mp_apply(callback: CallbackQuery, state: FSMContext):
+    """Записать стандартный комментарий во все собранные отгрузки."""
+    await callback.answer()
+    items = (await state.get_data()).get('cmt_mp') or []
+    if not items:
+        await callback.message.answer('Список устарел — собери заново.',
+                                      reply_markup=_period_keyboard())
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    progress = await callback.message.answer(f'⏳ Проставляю комментарий: {len(items)} отгрузок…')
+    done = await apply_marketplace_zero_fixes(items)
+    await state.update_data(cmt_mp=[])
+    from shared.keyboards import audit_menu_keyboard
+    await progress.edit_text(f'✅ Проставлено: {done} из {len(items)}.',
                              reply_markup=audit_menu_keyboard())

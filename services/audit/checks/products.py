@@ -4,6 +4,8 @@
 выполняются только в полном скане.
 """
 
+import re
+from collections import Counter
 from datetime import datetime
 
 from services.audit.context import AuditContext, is_free_supplier
@@ -288,6 +290,362 @@ class RootProductCheck(CheckSpec):
         return (f'Товар «{payload.get("product")}» лежит в корне справочника'
                 + (f' с кодом {code}' if code else ' без кода')
                 + '. Нужно положить в папку по типу товара и присвоить код по её схеме.')
+
+
+def _folder_full_path(folder: dict) -> str:
+    path = folder.get('pathName') or ''
+    return f'{path}/{folder["name"]}' if path else folder['name']
+
+
+class ProductInNonLeafFolderCheck(CheckSpec):
+    """Товар лежит в папке-разделе, у которой есть подпапки, а не в конечной.
+
+    Структура справочника — раздел → тип товара (напр. «Готовая продукция» →
+    «Шампунь для собак»); товары должны лежать только в конечных папках.
+    Товар в разделе теряется из отчётов по типу так же, как товар без папки
+    вовсе (product_without_folder) — просто на уровень выше."""
+
+    id = 'product_in_nonleaf_folder'
+    section = Section.PRODUCTS
+    title = 'Товар лежит в разделе, а не в конечной папке'
+    default_severity = Severity.WARNING
+    supports_incremental = False
+    llm_triage = False   # структура папок — факт, не вопрос суждения
+
+    async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
+        products = await ctx.cached_list(
+            'products_all_folder', 'product', expand='productFolder', order='name', max_rows=3000)
+        folders = await ctx.cached_list('productfolders_all', 'productfolder', max_rows=500)
+        parent_paths = {f['pathName'] for f in folders if f.get('pathName')}
+        nonleaf_ids = {f['id'] for f in folders if _folder_full_path(f) in parent_paths}
+
+        out = []
+        for p in products:
+            if p.get('archived'):
+                continue
+            folder = p.get('productFolder')
+            if not folder or folder['meta']['href'].split('/')[-1] not in nonleaf_ids:
+                continue
+            out.append(RawFinding(
+                entity_type='product',
+                entity_id=p['id'],
+                entity_href=p['meta']['href'],
+                entity_name=p.get('name', '?'),
+                severity=self.default_severity,
+                payload={'product': p.get('name'), 'folder': folder.get('name'),
+                         'code': (p.get('code') or '').strip() or None},
+                fingerprint_salt='',
+                ui_link=(p.get('meta') or {}).get('uuidHref', ''),
+            ))
+        return out
+
+    def explain(self, payload: dict) -> str:
+        return (f'Товар «{payload.get("product")}» лежит прямо в разделе '
+                f'«{payload.get("folder")}», у которого есть подпапки-типы. '
+                f'Нужно переложить в конечную подпапку по типу товара.')
+
+
+class ProductCodeSchemeCheck(CheckSpec):
+    """Код товара не совпадает с префиксом, принятым в его папке.
+
+    Схема компании: у каждой конечной папки — свой префикс кода (1 сырьё,
+    2 продукция, 3 этикетки, 4 тара, 5 хозтовары). Живой кейс: флакон и
+    крышка попали в «Тару» с кодами 3-143/3-144 — префиксом этикеток вместо
+    4-xxx. Большинство кодов папки задаёт «правильный» префикс, дырки в
+    нумерации при этом не проверяем — товар мог быть архивирован/удалён,
+    и дырка тогда норма, а не сигнал."""
+
+    id = 'product_code_scheme'
+    section = Section.PRODUCTS
+    title = 'Код товара не по схеме папки'
+    default_severity = Severity.WARNING
+    supports_incremental = False
+    llm_triage = False   # схема кодов — факт большинства, не вопрос суждения
+
+    _MIN_SAMPLES = 3   # меньше — не набралась статистика, молчим
+
+    async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
+        products = await ctx.cached_list(
+            'products_all_folder', 'product', expand='productFolder', order='name', max_rows=3000)
+        by_folder: dict[str, list[dict]] = {}
+        for p in products:
+            if p.get('archived'):
+                continue
+            folder = p.get('productFolder')
+            if not folder:
+                continue
+            fid = folder['meta']['href'].split('/')[-1]
+            by_folder.setdefault(fid, []).append(p)
+
+        # дубли кодов по всему справочнику — сигнал сам по себе, папка ни при чём
+        code_owners: dict[str, list[dict]] = {}
+        for p in products:
+            if p.get('archived'):
+                continue
+            code = (p.get('code') or '').strip()
+            if code:
+                code_owners.setdefault(code, []).append(p)
+
+        out = []
+        seen_dup_codes = set()
+        for items in by_folder.values():
+            prefixes = Counter()
+            for p in items:
+                code = (p.get('code') or '').strip()
+                if '-' in code:
+                    prefixes[code.split('-')[0]] += 1
+            folder_name = items[0]['productFolder'].get('name', '?')
+            has_majority = (prefixes and sum(prefixes.values()) >= self._MIN_SAMPLES
+                            and prefixes.most_common(1)[0][1]
+                                > sum(prefixes.values()) - prefixes.most_common(1)[0][1])
+            main_prefix = prefixes.most_common(1)[0][0] if has_majority else None
+
+            for p in items:
+                code = (p.get('code') or '').strip()
+                dupes = code_owners.get(code, [])
+                if code and len(dupes) > 1 and code not in seen_dup_codes:
+                    seen_dup_codes.add(code)
+                    out.append(RawFinding(
+                        entity_type='product',
+                        entity_id=p['id'],
+                        entity_href=p['meta']['href'],
+                        entity_name=f'{p.get("name", "?")} — дубль кода {code}',
+                        severity=Severity.WARNING,
+                        payload={'issue': 'duplicate_code', 'code': code,
+                                 'products': [d.get('name') for d in dupes]},
+                        fingerprint_salt=f'dup:{code}',
+                        ui_link=(p.get('meta') or {}).get('uuidHref', ''),
+                    ))
+                    continue
+                if main_prefix is None:
+                    continue
+                prefix = code.split('-')[0] if '-' in code else None
+                if prefix is None or prefix == main_prefix:
+                    continue
+                suffix = code.split('-', 1)[1] if '-' in code else None
+                out.append(RawFinding(
+                    entity_type='product',
+                    entity_id=p['id'],
+                    entity_href=p['meta']['href'],
+                    entity_name=p.get('name', '?'),
+                    severity=self.default_severity,
+                    payload={
+                        'issue': 'wrong_prefix',
+                        'product': p.get('name'),
+                        'code': code,
+                        'folder': folder_name,
+                        'expected_prefix': main_prefix,
+                        'suggested_code': (f'{main_prefix}-{suffix}'
+                                           if suffix and suffix.isdigit() else None),
+                    },
+                    fingerprint_salt=code,
+                    ui_link=(p.get('meta') or {}).get('uuidHref', ''),
+                ))
+        return out
+
+    def explain(self, payload: dict) -> str:
+        if payload.get('issue') == 'duplicate_code':
+            names = ', '.join(f'«{n}»' for n in payload.get('products', []))
+            return f'Код {payload.get("code")} присвоен нескольким товарам: {names}.'
+        tail = (f' По схеме папки должно быть {payload["suggested_code"]}.'
+                if payload.get('suggested_code') else '')
+        return (f'Товар «{payload.get("product")}» лежит в папке «{payload.get("folder")}», '
+                f'где у остальных товаров код начинается на {payload.get("expected_prefix")}-, '
+                f'а у него {payload.get("code")}.{tail}')
+
+
+_SIZE_RE = re.compile(r'(\d+)\s*(мл|г|л)\b', re.IGNORECASE)
+_FAMILY_TRIM_RE = re.compile(r'\s*\d+\s*(?:мл|г|л)\.?\s*(?:\([^)]*\))?\s*$', re.IGNORECASE)
+_ARTICLE_RE = re.compile(r'^(\d{3})\.(\d{3})\.(\d{2})$')
+
+
+def _extract_size(name: str) -> tuple[int, str] | None:
+    """Последнее число с единицей измерения в названии — это фасовка."""
+    matches = _SIZE_RE.findall(name)
+    if not matches:
+        return None
+    value, unit = matches[-1]
+    return int(value), unit.lower()
+
+
+def _family_name(name: str) -> str:
+    """Название товара без фасовки и цветовой пометки — для сравнения фасовок одного продукта."""
+    return _FAMILY_TRIM_RE.sub('', name).strip().lower()
+
+
+class ProductArticleSchemeCheck(CheckSpec):
+    """Артикул готовой продукции не по схеме GGG.NNN.VV.
+
+    GGG — группа товара (100 шампунь, 200 кондиционер, 300 репеллент,
+    400 амуниция), NNN — номер продукта внутри группы, VV — код фасовки.
+    VV = фасовка / делитель, но делитель РАЗНЫЙ по группам (подтверждено
+    реестром штрихкодов ДиСАИ и живыми данными): у шампуня/кондиционера/
+    репеллента делитель 100 (500 мл → 05, 5000 мл → 50, 300 мл → 03), а у
+    амуниции — 10 (200 мл → 20, 250 г → 25). Единой формулы нет, поэтому
+    делитель вычисляется по большинству пар «фасовка/VV» внутри каждой
+    группы, а не зашивается числом.
+
+    У одного продукта в разных фасовках NNN должен совпадать — меняется
+    только VV (живой кейс: Кока-Кола 500/5000 мл — 200.030.05/.50, совпадает;
+    а у Персик-овёс 500/5000 мл — 200.041.05/200.043.05, разъехался и NNN,
+    и VV). «Основы» (полуфабрикаты) и пробники артикула не имеют по
+    определению — это норма, не находка."""
+
+    id = 'product_article_scheme'
+    section = Section.PRODUCTS
+    title = 'Артикул товара не по схеме'
+    default_severity = Severity.WARNING
+    supports_incremental = False
+    llm_triage = False   # схема артикула — факт из названия и реестра, не суждение
+
+    _EXEMPT_MARKERS = ('основа', 'пробник')
+    _MIN_DIVISOR_SAMPLES = 3   # меньше — не набралась статистика на делитель, молчим
+
+    async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
+        products = await ctx.cached_list(
+            'products_all_folder', 'product', expand='productFolder', order='name', max_rows=3000)
+        finished = []
+        for p in products:
+            if p.get('archived'):
+                continue
+            folder = p.get('productFolder') or {}
+            in_finished_tree = (folder.get('name') == 'Готовая продукция'
+                                or folder.get('pathName') == 'Готовая продукция')
+            if not in_finished_tree:
+                continue
+            name_low = (p.get('name') or '').lower()
+            if any(m in name_low for m in self._EXEMPT_MARKERS):
+                continue
+            finished.append(p)
+
+        issues: dict[str, list[dict]] = {}   # product id -> issue dicts
+        parsed: dict[str, tuple] = {}         # product id -> (ggg, nnn, vv)
+        article_owners: dict[str, list[dict]] = {}
+        sizes: dict[str, tuple[int, str]] = {}   # product id -> (value, unit)
+
+        for p in finished:
+            article = (p.get('article') or '').strip()
+            if article:
+                article_owners.setdefault(article, []).append(p)
+            size = _extract_size(p.get('name') or '')
+            if size:
+                sizes[p['id']] = size
+            if not article:
+                issues.setdefault(p['id'], []).append({'kind': 'missing'})
+                continue
+            m = _ARTICLE_RE.match(article)
+            if not m:
+                issues.setdefault(p['id'], []).append({'kind': 'malformed', 'article': article})
+                continue
+            parsed[p['id']] = m.groups()
+
+        # делитель размера — по большинству пар (фасовка, VV) внутри группы GGG,
+        # а не зашитым числом: у амуниции он другой, чем у шампуня/кондиционера
+        divisor_votes: dict[str, Counter] = {}
+        for pid, (ggg, _nnn, vv) in parsed.items():
+            size = sizes.get(pid)
+            vv_int = int(vv)
+            if not size or vv_int == 0 or size[0] % vv_int:
+                continue
+            divisor_votes.setdefault(ggg, Counter())[size[0] // vv_int] += 1
+        group_divisor = {ggg: c.most_common(1)[0][0]
+                         for ggg, c in divisor_votes.items()
+                         if sum(c.values()) >= self._MIN_DIVISOR_SAMPLES}
+
+        def _expected_vv(ggg: str, size: tuple[int, str] | None) -> str | None:
+            divisor = group_divisor.get(ggg)
+            if not divisor or not size or size[0] % divisor:
+                return None
+            vv_int = size[0] // divisor
+            return f'{vv_int:02d}' if 0 < vv_int < 100 else None
+
+        for pid, (ggg, nnn, vv) in parsed.items():
+            expected_vv = _expected_vv(ggg, sizes.get(pid))
+            if expected_vv is None or expected_vv == vv:
+                continue
+            size = sizes[pid]
+            issues.setdefault(pid, []).append({
+                'kind': 'suffix_mismatch', 'article': f'{ggg}.{nnn}.{vv}',
+                'size': f'{size[0]} {size[1]}', 'expected_vv': expected_vv,
+                'suggested_article': f'{ggg}.{nnn}.{expected_vv}',
+            })
+
+        # дубли артикулов
+        for article, owners in article_owners.items():
+            if len(owners) > 1:
+                for p in owners:
+                    issues.setdefault(p['id'], []).append({
+                        'kind': 'duplicate', 'article': article,
+                        'products': [o.get('name') for o in owners],
+                    })
+
+        # NNN должен совпадать у фасовок одного продукта
+        families: dict[tuple[str, str], list[str]] = {}   # (ggg, family) -> [product_id,...]
+        for pid, (ggg, _nnn, _vv) in parsed.items():
+            families.setdefault((ggg, _family_name(next(
+                p for p in finished if p['id'] == pid).get('name') or '')), []).append(pid)
+        by_id = {p['id']: p for p in finished}
+        for (ggg, _fam), pids in families.items():
+            nnns = {parsed[pid][1] for pid in pids}
+            if len(nnns) <= 1:
+                continue
+            # эталон — фасовка с наименьшим объёмом: по живым кейсам именно она
+            # регистрируется первой (штрихкод/реестр), остальные подстраиваются
+            canonical_pid = min(pids, key=lambda pid: sizes.get(pid) or (10 ** 9, ''))
+            canonical_nnn = parsed[canonical_pid][1]
+            siblings = [by_id[pid].get('name') for pid in pids]
+            for pid in pids:
+                if parsed[pid][1] == canonical_nnn:
+                    continue
+                ggg_, _nnn, vv_ = parsed[pid]
+                # если для этой фасовки уже известен правильный VV — используем его,
+                # а не старый (он мог быть неверным вместе с NNN, живой кейс:
+                # Персик-овёс 5000 мл: 200.043.05 → должно быть 200.041.50)
+                fixed_vv = _expected_vv(ggg_, sizes.get(pid)) or vv_
+                issues.setdefault(pid, []).append({
+                    'kind': 'nnn_mismatch', 'article': f'{ggg_}.{_nnn}.{vv_}',
+                    'expected_nnn': canonical_nnn,
+                    'suggested_article': f'{ggg_}.{canonical_nnn}.{fixed_vv}',
+                    'siblings': siblings,
+                })
+
+        out = []
+        for pid, item_issues in issues.items():
+            p = by_id.get(pid) or next(x for x in finished if x['id'] == pid)
+            out.append(RawFinding(
+                entity_type='product',
+                entity_id=p['id'],
+                entity_href=p['meta']['href'],
+                entity_name=p.get('name', '?'),
+                severity=self.default_severity,
+                payload={'product': p.get('name'), 'article': (p.get('article') or '').strip(),
+                         'issues': item_issues},
+                fingerprint_salt=','.join(sorted(i['kind'] for i in item_issues)),
+                ui_link=(p.get('meta') or {}).get('uuidHref', ''),
+            ))
+        return out
+
+    def explain(self, payload: dict) -> str:
+        parts = []
+        for i in payload.get('issues', []):
+            kind = i['kind']
+            if kind == 'missing':
+                parts.append('у готового товара нет артикула')
+            elif kind == 'malformed':
+                parts.append(f'артикул «{i["article"]}» не в формате GGG.NNN.VV')
+            elif kind == 'suffix_mismatch':
+                parts.append(f'артикул «{i["article"]}» — фасовка {i["size"]}, '
+                             f'суффикс должен быть {i["expected_vv"]} '
+                             f'(предлагаемый артикул {i["suggested_article"]})')
+            elif kind == 'duplicate':
+                names = ', '.join(f'«{n}»' for n in i.get('products', []))
+                parts.append(f'артикул «{i["article"]}» присвоен нескольким товарам: {names}')
+            elif kind == 'nnn_mismatch':
+                sib = ', '.join(f'«{n}»' for n in i.get('siblings', []))
+                parts.append(f'номер продукта в артикуле «{i["article"]}» не совпадает с '
+                             f'фасовками того же товара ({sib}); '
+                             f'предлагаемый артикул {i["suggested_article"]}')
+        return f'Товар «{payload.get("product")}»: ' + '; '.join(parts) + '.'
 
 
 class FifoDeviationCheck(CheckSpec):

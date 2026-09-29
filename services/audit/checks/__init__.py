@@ -7,6 +7,9 @@ from services.audit.checks.production import ProductionRetroEditCheck, Productio
 from services.audit.checks.products import (
     FifoDeviationCheck,
     FifoZeroCheck,
+    ProductArticleSchemeCheck,
+    ProductCodeSchemeCheck,
+    ProductInNonLeafFolderCheck,
     RootProductCheck,
 )
 from services.audit.checks.purchases import OrderSupplyMismatchCheck, SupplyZeroPriceCheck
@@ -42,6 +45,9 @@ def build_registry() -> list[CheckSpec]:
         FifoZeroCheck(),
         FifoDeviationCheck(),
         RootProductCheck(),
+        ProductInNonLeafFolderCheck(),
+        ProductCodeSchemeCheck(),
+        ProductArticleSchemeCheck(),
         DemandZeroCheck(),
         DemandNoOverheadCheck(),
         DemandOverheadPaymentCheck(),

@@ -14,7 +14,7 @@ import aiohttp
 from core import config
 from core.logger import logger
 from integrations.moysklad_audit import MoySkladAuditClient
-from services.audit.context import delivery_method, format_moment
+from services.audit.context import delivery_method, format_moment, is_marketplace
 from services.audit.team_context import (
     AUTHOR_FINANCE,
     AUTHOR_MARKETPLACE,
@@ -43,6 +43,10 @@ ENTITIES = {
 }
 
 _BATCH_SIZE = 8
+
+# стандартный комментарий отгрузки маркетплейсу с нулевыми накладными —
+# используется и в промпте LLM, и в пакетной кнопке (единственное место истины)
+DEMAND_MARKETPLACE_ZERO_COMMENT = 'Накладные расходы 0 — доставку оплачивает маркетплейс.'
 
 _STYLE = (
     'Единый стиль (применяй ко ВСЕМ правкам одинаково, без исключений):\n'
@@ -124,7 +128,7 @@ _DEMAND_SYSTEM = (
     'Правила для комментария отгрузки (new_comment):\n'
     '• Накладные расходы = 0 → комментарий обязан объяснять почему, единым форматом '
     f'«Накладные расходы 0 — причина.»: «Накладные расходы 0 — самовывоз.», '
-    f'«Накладные расходы 0 — доставку оплачивает маркетплейс.» (контрагенты-маркетплейсы: '
+    f'«{DEMAND_MARKETPLACE_ZERO_COMMENT}» (контрагенты-маркетплейсы: '
     f'{MARKETPLACES}), «Накладные расходы 0 — доставку оплачивал получатель.» '
     'Причину собери из комментариев отгрузки и заказа и контрагента; '
     'если причины нигде нет — new_comment оставь null, НЕ выдумывай.\n'
@@ -523,6 +527,57 @@ async def apply_dot_fixes(items: list[dict]) -> int:
                 done += 1
             except Exception as e:
                 logger.warning(f'[comments] точка не записалась в {item["label"]}: {e}')
+    return done
+
+
+async def collect_marketplace_zero_fixes(days: int) -> list[dict]:
+    """Отгрузки маркетплейсу с нулевыми накладными и пустым комментарием —
+    для пакетной правки одним стандартным текстом.
+
+    Собирается кодом, без LLM: правило механическое (владелец подтвердил —
+    «просто отгрузка», без разбора по одной). Трогаем только ПУСТОЙ
+    комментарий — уже заполненный текст может нести содержательную причину
+    и должен пройти обычное ревью, а не перезаписываться шаблоном."""
+    client = MoySkladAuditClient()
+    filters = (f'moment>={format_moment(datetime.now() - timedelta(days=days))}'
+               if days > 0 else '')
+    async with new_session() as session:
+        docs = await client.list_entities(
+            session, 'demand', filters=filters, expand='agent', order='moment,asc', max_rows=2000)
+    out = []
+    for d in docs:
+        if d.get('applicable') is False:
+            continue
+        if (d.get('overhead') or {}).get('sum', 0) > 0:
+            continue
+        if (d.get('description') or '').strip():
+            continue
+        if _too_fresh(d.get('moment')):
+            continue
+        agent_name = ((d.get('agent') or {}).get('name')
+                      if isinstance(d.get('agent'), dict) else None)
+        if not is_marketplace(agent_name):
+            continue
+        out.append({'entity': 'demand', 'id': d['id'],
+                    'label': f'Отгрузка №{d.get("name")} от {(d.get("moment") or "")[:10]} '
+                             f'({agent_name})',
+                    'comment': '', 'new_comment': DEMAND_MARKETPLACE_ZERO_COMMENT})
+    return out
+
+
+async def apply_marketplace_zero_fixes(items: list[dict]) -> int:
+    """Записать стандартный комментарий пачкой; вернуть число обновлённых документов."""
+    client = MoySkladAuditClient()
+    done = 0
+    async with new_session() as session:
+        for item in items:
+            try:
+                await client.update_entity(session, item['entity'], item['id'],
+                                           {'description': item['new_comment']})
+                done += 1
+            except Exception as e:
+                logger.warning(f'[comments] маркетплейс-комментарий не записался в '
+                               f'{item["label"]}: {e}')
     return done
 
 

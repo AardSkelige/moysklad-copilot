@@ -838,14 +838,46 @@ class TestCounterpartyBalance:
                           'agent': {'meta': {'href': f'{MS}/entity/counterparty/cap'}},
                           'meta': {'href': f'{MS}/entity/contract/c1'}}],
             'commissionreportin': [_doc('commissionreportin', 'r1', '00008',
-                                        '2026-07-28 10:00:00', sum=7868000, agent=agent)],
+                                        '2026-07-28 10:00:00', sum=7868000,
+                                        commitentSum=6171485, agent=agent)],
         }
         found = await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None)
         assert len(found) == 1
         p = found[0].payload
         assert p['sold_by_commission_rub'] == 78680.0
         assert p['goods_on_partner_shelf_rub'] == 249083.0
-        assert '78 680.00' in p['signals'][0]
+        # долг — сумма коммитента, вознаграждение комиссионера долгом не считается
+        assert '61 714.85' in p['signals'][0]
+        assert p['commission_reward_rub'] == 16965.15
+
+    async def test_commission_reward_is_not_debt(self):
+        # Живой кейс Каприоля 29.09: сравнение оплат с выручкой отчётов (sum)
+        # давало фантомный долг — вознаграждение 30% нам не причитается
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        agent = self._agent('cap3', 'КРМОО Каприоль')
+        data = {
+            'demand': [_doc('demand', 'd1', '00148', '2026-08-07 10:00:00',
+                            sum=20000000, agent=agent)],
+            'contract': [{'id': 'c3', 'contractType': 'Commission',
+                          'agent': {'meta': {'href': f'{MS}/entity/counterparty/cap3'}},
+                          'meta': {'href': f'{MS}/entity/contract/c3'}}],
+            'commissionreportin': [
+                _doc('commissionreportin', 'r1', '00012', '2026-08-27 10:00:00',
+                     sum=8116000, commitentSum=5679160, payedSum=5679160, agent=agent),
+                _doc('commissionreportin', 'r2', '00018', '2026-09-28 10:00:00',
+                     sum=4529778, commitentSum=3170845, payedSum=0, agent=agent),
+            ],
+            'paymentin': [_doc('paymentin', 'p1', '00078', '2026-09-08 10:00:00',
+                               sum=5679160, agent=agent)],
+        }
+        found = await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None)
+        assert len(found) == 1
+        p = found[0].payload
+        # долг ровно по неоплаченному отчёту, без вознаграждения
+        assert '31 708.45' in p['signals'][0]
+        assert p['unpaid_commission_reports'] == [
+            {'report': 'Отчёт комиссионера №00018 от 2026-09-28',
+             'awaiting_payment_rub': 31708.45}]
 
     async def test_commission_agent_settled_is_silent(self):
         # продано по отчёту и оплачено — расхождения нет, хотя отгружено больше
@@ -858,7 +890,8 @@ class TestCounterpartyBalance:
                           'agent': {'meta': {'href': f'{MS}/entity/counterparty/cap2'}},
                           'meta': {'href': f'{MS}/entity/contract/c2'}}],
             'commissionreportin': [_doc('commissionreportin', 'r2', '00009',
-                                        '2026-07-28 10:00:00', sum=854000, agent=agent)],
+                                        '2026-07-28 10:00:00', sum=1220000,
+                                        commitentSum=854000, agent=agent)],
             'paymentin': [_doc('paymentin', 'p1', '00050', '2026-07-29 10:00:00',
                                sum=854000, agent=agent)],
         }

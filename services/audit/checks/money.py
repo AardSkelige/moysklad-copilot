@@ -247,14 +247,29 @@ class CounterpartyBalanceCheck(CheckSpec):
             href = ((c.get('agent') or {}).get('meta') or {}).get('href', '')
             if href:
                 commission_agents.add(href.split('?')[0])
+        # Нам комиссионер должен не выручку отчёта (sum), а сумму коммитента
+        # (commitentSum = выручка − его вознаграждение). Живой кейс Каприоля
+        # 29.09: сравнение с sum дало фантомный долг 140 тыс., из них 71 тыс. —
+        # вознаграждение 30%, остальное — отчёты, заведённые накануне.
         sold_by_commission: dict[str, int] = {}
+        owed_by_commission: dict[str, int] = {}
+        unpaid_reports: dict[str, list] = {}
         for r in await ctx.cached_list('commissionreportin_all', 'commissionreportin',
                                        expand='agent', order='moment,desc', max_rows=1000):
             if r.get('applicable') is False:
                 continue
             href = ((r.get('agent') or {}).get('meta') or {}).get('href', '').split('?')[0]
-            if href:
-                sold_by_commission[href] = sold_by_commission.get(href, 0) + r.get('sum', 0)
+            if not href:
+                continue
+            owed = r.get('commitentSum', 0)
+            sold_by_commission[href] = sold_by_commission.get(href, 0) + r.get('sum', 0)
+            owed_by_commission[href] = owed_by_commission.get(href, 0) + owed
+            unpaid = owed - (r.get('payedSum') or 0)
+            if unpaid > 0:
+                unpaid_reports.setdefault(href, []).append({
+                    'report': f'Отчёт комиссионера №{r.get("name")} от {(r.get("moment") or "")[:10]}',
+                    'awaiting_payment_rub': round(unpaid / 100, 2),
+                })
 
         # Недопоставленные заказы поставщикам: «переплата», покрытая ожидаемой
         # поставкой, — это аванс, а не проблема (кейс Тара.ру: заказ «Заказано»,
@@ -325,8 +340,8 @@ class CounterpartyBalanceCheck(CheckSpec):
             supplier_balance = s['paid_out'] - s['supplies']   # >0 — переплатили поставщику
             on_commission = href in commission_agents or href in sold_by_commission
             sold = sold_by_commission.get(href, 0)
-            # у комиссионера продажей считается отчёт, а не отгрузка
-            customer_base = sold if on_commission else s['demands']
+            # у комиссионера долг — сумма коммитента по отчётам, а не отгрузка
+            customer_base = owed_by_commission.get(href, 0) if on_commission else s['demands']
             customer_balance = customer_base - s['paid_in']     # >0 — нам должны
             on_shelf = s['demands'] - sold if on_commission else 0
             awaiting = sum(p['awaiting_kopecks'] for p in pending_orders.get(href, []))
@@ -373,6 +388,12 @@ class CounterpartyBalanceCheck(CheckSpec):
                     'on_commission': on_commission,
                     'sold_by_commission_rub': round(sold / 100, 2) if on_commission else None,
                     'goods_on_partner_shelf_rub': round(on_shelf / 100, 2) if on_commission else None,
+                    'owed_by_commission_reports_rub': (
+                        round(owed_by_commission.get(href, 0) / 100, 2) if on_commission else None),
+                    'commission_reward_rub': (
+                        round((sold - owed_by_commission.get(href, 0)) / 100, 2)
+                        if on_commission else None),
+                    'unpaid_commission_reports': unpaid_reports.get(href, [])[:5],
                     'recent_docs': s['docs'][:15],
                     'open_purchase_orders': [
                         {'order': p['order'],
@@ -395,8 +416,13 @@ class CounterpartyBalanceCheck(CheckSpec):
                              'в комментарии, — норма, если договорённость свежая; '
                              'давний долг без движения — повод напомнить покупателю. '
                              'Для комиссионера (on_commission) долгом считается только '
-                             'проданное по отчётам комиссионера; goods_on_partner_shelf_rub — '
-                             'наш товар у него на реализации, это НЕ долг и не потеря.'),
+                             'сумма к выплате по его отчётам (owed_by_commission_reports_rub = '
+                             'продано минус его вознаграждение commission_reward_rub); '
+                             'вознаграждение он оставляет себе, это НЕ долг. '
+                             'goods_on_partner_shelf_rub — наш товар у него на реализации, '
+                             'это тоже НЕ долг и не потеря. Неоплаченные отчёты перечислены '
+                             'в unpaid_commission_reports: свежий отчёт (до ~2 недель) — '
+                             'норма, выплата ещё в пути; давний — повод напомнить.'),
                 },
                 # изменение баланса = новый сигнал; стабильный — молчит после ack
                 fingerprint_salt=f'{supplier_balance}|{customer_balance}',
