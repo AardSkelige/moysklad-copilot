@@ -45,6 +45,14 @@ def _ssl_ctx() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
 
+class _ServerDown(Exception):
+    """502/503/504: МойСклад временно не отвечает — пробуем снова, как при обрыве связи."""
+
+    def __init__(self, status: int):
+        super().__init__(f'МойСклад временно недоступен (ошибка {status})')
+        self.status = status
+
+
 class _Retry429(Exception):
     """Лимит запросов: ждём столько, сколько просит API, и пробуем снова."""
 
@@ -95,6 +103,13 @@ class MoySkladHTTP:
                     await asyncio.sleep(_PACE_SECONDS)
                 try:
                     return await self._attempt(session, method, url, payload)
+                except _ServerDown as e:
+                    if attempt == _RETRY_LIMIT - 1:
+                        # без HTML-страницы ошибки: этот текст уходит владельцу в чат
+                        raise RuntimeError(str(e)) from e
+                    pause = 2 ** (attempt + 1)
+                    logger.warning(f'[ms] {e} на {url[:90]}, повтор через {pause}с')
+                    await asyncio.sleep(pause)
                 except _RETRIABLE as e:
                     if attempt == _RETRY_LIMIT - 1:
                         raise
@@ -119,6 +134,8 @@ class MoySkladHTTP:
                 raise _Retry429(min(retry_after, 30))
             if r.status == 404:
                 return None
+            if r.status in (502, 503, 504):
+                raise _ServerDown(r.status)
             if r.status >= 400:
                 text = await r.text()
                 raise RuntimeError(f'{method} {url[:150]} → {r.status}: {text[:300]}')

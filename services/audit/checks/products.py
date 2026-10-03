@@ -117,9 +117,13 @@ async def _last_supply_prices(ctx: AuditContext) -> dict[str, dict]:
     return out
 
 
-async def _product_source_docs(ctx: AuditContext) -> tuple[dict[str, list], dict[str, str]]:
+async def _product_source_docs(
+    ctx: AuditContext,
+) -> tuple[dict[str, list], dict[str, str], dict[str, str]]:
     """(href товара -> документы-источники с ценами и комментариями,
-    href товара -> uuidHref для UI-ссылки).
+    href товара -> uuidHref для UI-ссылки,
+    название документа-источника -> uuidHref — ссылки держим отдельно от фактов,
+    чтобы не гонять их через LLM).
 
     Комментарий источника — ключ к вердикту: «Имя: тара, которую отдали
     бесплатно» делает нулевую цену нормой, а не ошибкой.
@@ -127,6 +131,7 @@ async def _product_source_docs(ctx: AuditContext) -> tuple[dict[str, list], dict
     (кейс флакона: оприходование от марта при окне с апреля)."""
     sources: dict[str, list] = {}
     ui_links: dict[str, str] = {}
+    doc_links: dict[str, str] = {}
     for entity, label in (('supply', 'Приёмка'), ('enter', 'Оприходование')):
         docs = await ctx.cached_list(
             f'{entity}_all_history', entity,
@@ -151,10 +156,11 @@ async def _product_source_docs(ctx: AuditContext) -> tuple[dict[str, list], dict
                     'price_kopecks': p.get('price', 0),
                     'comment': (d.get('description') or '')[:200],
                 }
+                doc_links[source['doc']] = (d.get('meta') or {}).get('uuidHref', '')
                 if entity == 'supply':   # у оприходования оплаты не бывает
                     source['payment'] = _payment_state(d)
                 sources.setdefault(href, []).append(source)
-    return sources, ui_links
+    return sources, ui_links, doc_links
 
 
 def previous_receipt_price(sources: list[dict], before_moment: str) -> dict | None:
@@ -185,7 +191,7 @@ class FifoZeroCheck(CheckSpec):
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
         rows = await ctx.client.stock_all(ctx.session, stock_mode='all')
         last = await _last_supply_prices(ctx)
-        sources, ui_links = await _product_source_docs(ctx)
+        sources, ui_links, doc_links = await _product_source_docs(ctx)
         out = []
         for r in rows:
             if r.get('stock', 0) <= 0 or r.get('price', 0) != 0:
@@ -193,11 +199,16 @@ class FifoZeroCheck(CheckSpec):
             href = r.get('meta', {}).get('href', '').split('?')[0]
             if _explained_as_free(sources.get(href, []), last.get(href)):
                 continue   # «получено бесплатно» написано в документе — ноль корректен
+            # чинить владелец будет документ, внёсший ноль, а не карточку товара —
+            # ссылка ведёт туда (находка по-прежнему одна на товар)
+            zero_doc = next((s for s in reversed(sources.get(href, []))
+                             if not s.get('price_kopecks')), None)
             out.append(RawFinding(
                 entity_type='product',
                 entity_id=href.split('/')[-1],
                 entity_href=href,
-                entity_name=r.get('name', '?'),
+                entity_name=(f'{zero_doc["doc"]} · {r.get("name", "?")}' if zero_doc
+                             else r.get('name', '?')),
                 severity=self.default_severity,
                 payload={
                     'product': r.get('name'),
@@ -218,7 +229,8 @@ class FifoZeroCheck(CheckSpec):
                              'если пусто — товар никогда не стоил денег.'),
                 },
                 fingerprint_salt='',
-                ui_link=ui_links.get(href, ''),
+                ui_link=(doc_links.get(zero_doc['doc']) if zero_doc else None)
+                        or ui_links.get(href, ''),
             ))
         return out
 
@@ -662,7 +674,7 @@ class FifoDeviationCheck(CheckSpec):
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
         rows = await ctx.client.stock_all(ctx.session, stock_mode='all')
         last = await _last_supply_prices(ctx)
-        sources, ui_links = await _product_source_docs(ctx)
+        sources, ui_links, _ = await _product_source_docs(ctx)
         out = []
         batches_budget = _MAX_BATCH_REPORTS
         for r in rows:

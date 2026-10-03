@@ -36,7 +36,7 @@ class EnterPriceVsFifoCheck(CheckSpec):
         )
         fifo = await ctx.stock_fifo_map()
         uoms = await ctx.uom_map()
-        sources, _ = await _product_source_docs(ctx)
+        sources, _, _ = await _product_source_docs(ctx)
         out = []
         for d in docs:
             suspicious = []

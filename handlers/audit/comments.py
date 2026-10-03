@@ -4,6 +4,8 @@
 предложение («упустил кондей», «допиши причину») — карточка обновляется.
 """
 
+import time
+
 from aiogram import F, Router
 from aiogram.enums import ContentType
 from aiogram.fsm.context import FSMContext
@@ -13,14 +15,14 @@ from core import config
 from core.logger import logger
 from services.audit import review_tracker
 from services.audit.comment_review import (
-    DEMAND_MARKETPLACE_ZERO_COMMENT,
-    apply_comment, apply_demand, apply_dot_fixes, apply_finance, apply_marketplace_zero_fixes,
+    apply_batch_comments, apply_comment, apply_demand, apply_finance,
     collect_documents, collect_dot_fixes, collect_finance_documents,
     collect_marketplace_zero_fixes, refine_comment, refine_demand,
     refine_finance, review_documents, review_finance_documents,
 )
 from shared import session_scope
 from shared.constants import CallbackData, CallbackPrefix
+from shared.errors import user_error_text
 from shared.filters import IsAuditOwnerFilter
 from shared.states import AuditState
 
@@ -43,6 +45,34 @@ _MENU_EXPLAIN = (
     'накладными и пустым комментарием: ставит стандартную фразу пачкой, без карточек.\n\n'
     'Выбери набор и период:'
 )
+
+
+class _ProgressMessage:
+    """Одно сообщение, которое обновляется по ходу работы — видно, что бот жив,
+    а чат не засоряется. Правка не чаще раза в несколько секунд (лимиты Telegram)."""
+
+    _MIN_INTERVAL = 4.0
+
+    def __init__(self, message):
+        self.message = message
+        self._last = 0.0
+
+    async def update(self, text: str):
+        if time.monotonic() - self._last < self._MIN_INTERVAL:
+            return
+        self._last = time.monotonic()
+        try:
+            await self.message.edit_text(text)
+        except Exception:
+            pass   # «не изменилось» / сеть Telegram — ход работы не важнее самой работы
+
+    async def finish(self, text: str, reply_markup=None):
+        """Итог: если правка не прошла — новым сообщением, но владелец его увидит."""
+        try:
+            await self.message.edit_text(text, reply_markup=reply_markup)
+        except Exception:
+            logger.warning('[comments] итог не встал в сообщение хода работы', exc_info=True)
+            await self.message.answer(text, reply_markup=reply_markup)
 
 
 def _period_keyboard() -> InlineKeyboardMarkup:
@@ -158,25 +188,28 @@ async def on_comments_start(callback: CallbackQuery, state: FSMContext):
     is_finance = kind == 'fin'
     scope = (f'{"финансовые документы" if is_finance else "документы учёта"} '
              f'({"вся история" if days <= 0 else f"за {days} дн."}')
-    progress = await callback.message.answer(
-        f'💬 Собираю {scope}) и оцениваю по стандарту — '
-        f'{"несколько минут" if days > 0 else "это займёт заметное время"}…'
-    )
+    progress = _ProgressMessage(await callback.message.answer(
+        f'💬 Собираю {scope})…'))
     try:
         docs, failed = await (collect_finance_documents(days) if is_finance
                               else collect_documents(days))
         # документ, показанный дважды и не изменившийся, больше не предлагаем
         async with session_scope() as session:
             docs = await review_tracker.filter_seen(session, docs)
-        suggestions = await (review_finance_documents(docs) if is_finance
-                             else review_documents(docs))
+
+        async def on_batch(done: int, total: int):
+            await progress.update(f'💬 Оцениваю {len(docs)} документов по стандарту: '
+                                  f'пачка {done} из {total}…')
+
+        suggestions = await (review_finance_documents(docs, progress=on_batch) if is_finance
+                             else review_documents(docs, progress=on_batch))
     except Exception as e:
         logger.exception('comment review failed')
-        await progress.edit_text(f'❌ Не получилось: {e}',
-                                 reply_markup=_period_keyboard())
+        await progress.finish(f'❌ Не получилось: {user_error_text(e)}',
+                              reply_markup=_period_keyboard())
         return
     try:
-        await progress.delete()
+        await progress.message.delete()
     except Exception:
         pass
     if failed:
@@ -235,7 +268,7 @@ async def _refine_current(message: Message, state: FSMContext, instruction: str)
         item['reason'] = f'учтено твоё замечание: {instruction[:120]}'
     except Exception as e:
         logger.exception('refine comment failed')
-        await message.answer(f'❌ Не получилось: {e}')
+        await message.answer(f'❌ Не получилось: {user_error_text(e)}')
         return
     finally:
         try:
@@ -266,7 +299,7 @@ async def on_comment_apply(callback: CallbackQuery, state: FSMContext):
     except Exception as e:
         logger.exception('apply comment failed')
         await callback.answer('Не удалось записать', show_alert=True)
-        await callback.message.answer(f'❌ {item["label"]}: {e}')
+        await callback.message.answer(f'❌ {item["label"]}: {user_error_text(e)}')
         return
     try:
         # хэш записанного состояния: правка бота не обнуляет счётчик показов
@@ -307,97 +340,55 @@ async def on_comment_stop(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@router.callback_query(F.data == CallbackData.AUDIT_COMMENT_DOTS)
-async def on_dots_preview(callback: CallbackQuery, state: FSMContext):
-    """Список документов, которым не хватает только точки в конце."""
-    await callback.answer()
-    progress = await callback.message.answer('📍 Ищу комментарии без точки…')
-    try:
-        items = await collect_dot_fixes(config.AUDIT_COMMENT_REVIEW_DAYS)
-    except Exception as e:
-        logger.exception('dot fixes collect failed')
-        await progress.edit_text(f'❌ Не получилось: {e}',
-                                 reply_markup=_period_keyboard())
-        return
-    if not items:
-        await progress.edit_text('Все комментарии заканчиваются точкой 🎉',
-                                 reply_markup=_period_keyboard())
-        return
-    await state.update_data(cmt_dots=items)
-    shown = '\n'.join(f'• {i["label"]} — {i["comment"][:60]}' for i in items[:15])
-    tail = f'\n… и ещё {len(items) - 15}' if len(items) > 15 else ''
-    await progress.edit_text(
-        f'📍 <b>{len(items)} документов без точки в конце</b>\n\n{shown}{tail}\n\n'
-        f'Поставить точку везде?',
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text='✏️ Поставить точки',
-                                 callback_data=CallbackData.AUDIT_COMMENT_DOTS_GO),
-            InlineKeyboardButton(text='👌 Не надо', callback_data=CallbackData.AUDIT_COMMENTS),
-        ]]),
-    )
+async def _run_batch_fix(callback: CallbackQuery, collect, title: str,
+                         doing: str, nothing: str, done_text: str):
+    """Собрать документы и сразу записать правку — без промежуточного «Поставить?».
 
-
-@router.callback_query(F.data == CallbackData.AUDIT_COMMENT_DOTS_GO)
-async def on_dots_apply(callback: CallbackQuery, state: FSMContext):
-    """Записать точки во все собранные документы."""
+    Правила механические и владелец их уже утвердил; второй шаг с подтверждением
+    только добавлял нажатие."""
     await callback.answer()
-    items = (await state.get_data()).get('cmt_dots') or []
-    if not items:
-        await callback.message.answer('Список устарел — собери заново.',
-                                      reply_markup=_period_keyboard())
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    progress = await callback.message.answer(f'⏳ Ставлю точки: {len(items)} документов…')
-    done = await apply_dot_fixes(items)
-    await state.update_data(cmt_dots=[])
     from shared.keyboards import audit_menu_keyboard
-    await progress.edit_text(f'✅ Точки поставлены: {done} из {len(items)}.',
-                             reply_markup=audit_menu_keyboard())
-
-
-@router.callback_query(F.data == CallbackData.AUDIT_COMMENT_MP)
-async def on_mp_preview(callback: CallbackQuery, state: FSMContext):
-    """Список пустых отгрузок маркетплейсов с нулевыми накладными."""
-    await callback.answer()
-    progress = await callback.message.answer('📦 Ищу пустые отгрузки маркетплейсов…')
+    progress = _ProgressMessage(await callback.message.answer(f'{title}…'))
     try:
-        items = await collect_marketplace_zero_fixes(config.AUDIT_COMMENT_REVIEW_DAYS)
+        items = await collect(config.AUDIT_COMMENT_REVIEW_DAYS)
+        if not items:
+            await progress.finish(nothing, reply_markup=_period_keyboard())
+            return
+
+        async def on_item(n: int, total: int):
+            await progress.update(f'⏳ {doing}: {n} из {total}…')
+
+        await progress.update(f'⏳ {doing}: 0 из {len(items)}…')
+        done = await apply_batch_comments(items, progress=on_item)
     except Exception as e:
-        logger.exception('marketplace zero fixes collect failed')
-        await progress.edit_text(f'❌ Не получилось: {e}',
-                                 reply_markup=_period_keyboard())
+        logger.exception(f'batch comment fix failed: {title}')
+        await progress.finish(f'❌ Не получилось: {user_error_text(e)}',
+                              reply_markup=_period_keyboard())
         return
-    if not items:
-        await progress.edit_text('Пустых отгрузок маркетплейсов нет 🎉',
-                                 reply_markup=_period_keyboard())
-        return
-    await state.update_data(cmt_mp=items)
-    shown = '\n'.join(f'• {i["label"]}' for i in items[:15])
-    tail = f'\n… и ещё {len(items) - 15}' if len(items) > 15 else ''
-    await progress.edit_text(
-        f'📦 <b>{len(items)} отгрузок без комментария</b>\n\n{shown}{tail}\n\n'
-        f'Поставить «{DEMAND_MARKETPLACE_ZERO_COMMENT}» везде?',
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text='✏️ Проставить всем',
-                                 callback_data=CallbackData.AUDIT_COMMENT_MP_GO),
-            InlineKeyboardButton(text='👌 Не надо', callback_data=CallbackData.AUDIT_COMMENTS),
-        ]]),
-    )
+    tail = (f'\n⚠️ Не записались {len(items) - done} — МойСклад не принял, '
+            f'запусти ещё раз позже.' if done < len(items) else '')
+    await progress.finish(f'✅ {done_text}: {done} из {len(items)}.{tail}',
+                          reply_markup=audit_menu_keyboard())
 
 
-@router.callback_query(F.data == CallbackData.AUDIT_COMMENT_MP_GO)
-async def on_mp_apply(callback: CallbackQuery, state: FSMContext):
-    """Записать стандартный комментарий во все собранные отгрузки."""
-    await callback.answer()
-    items = (await state.get_data()).get('cmt_mp') or []
-    if not items:
-        await callback.message.answer('Список устарел — собери заново.',
-                                      reply_markup=_period_keyboard())
-        return
-    await callback.message.edit_reply_markup(reply_markup=None)
-    progress = await callback.message.answer(f'⏳ Проставляю комментарий: {len(items)} отгрузок…')
-    done = await apply_marketplace_zero_fixes(items)
-    await state.update_data(cmt_mp=[])
-    from shared.keyboards import audit_menu_keyboard
-    await progress.edit_text(f'✅ Проставлено: {done} из {len(items)}.',
-                             reply_markup=audit_menu_keyboard())
+# *_GO — кнопки из старых сообщений с подтверждением: ведут туда же
+@router.callback_query(F.data.in_({CallbackData.AUDIT_COMMENT_DOTS,
+                                   CallbackData.AUDIT_COMMENT_DOTS_GO}))
+async def on_dots(callback: CallbackQuery):
+    """Поставить точку в конце комментариев, которым не хватает только её."""
+    await _run_batch_fix(callback, collect_dot_fixes,
+                         title='📍 Ищу комментарии без точки',
+                         doing='Ставлю точки',
+                         nothing='Все комментарии заканчиваются точкой 🎉',
+                         done_text='Точки поставлены')
+
+
+@router.callback_query(F.data.in_({CallbackData.AUDIT_COMMENT_MP,
+                                   CallbackData.AUDIT_COMMENT_MP_GO}))
+async def on_marketplace(callback: CallbackQuery):
+    """Проставить стандартный комментарий отгрузкам маркетплейсов с нулевыми накладными."""
+    await _run_batch_fix(callback, collect_marketplace_zero_fixes,
+                         title='📦 Собираю отгрузки маркетплейсов',
+                         doing='Проставляю комментарий',
+                         nothing='Все отгрузки маркетплейсов уже с комментарием 🎉',
+                         done_text='Проставлено')

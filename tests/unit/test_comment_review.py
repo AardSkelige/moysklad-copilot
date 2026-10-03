@@ -25,6 +25,34 @@ def _doc(entity='supply', doc_id='d1', label='Приёмка №00049', comment=
             'agent': 'ХИМТОРГ ПРИМЕР', 'sum_rub': 17570.0, 'comment': comment}
 
 
+class TestBatchProgress:
+    async def test_progress_counts_batches_across_phases(self):
+        """Владелец видит общий счёт пачек: и обычных документов, и отгрузок."""
+        ok = {'content': '[]', 'tool_calls': []}
+        llm = FakeLLM([ok, ok, ok])
+        docs = [_doc(doc_id=f'd{i}') for i in range(9)] + [_demand()]
+        seen = []
+
+        async def progress(done, total):
+            seen.append((done, total))
+
+        await review_documents(docs, llm=llm, progress=progress)
+        assert llm.calls == 3
+        assert seen[-1] == (3, 3)
+        assert sorted(seen) == [(1, 3), (2, 3), (3, 3)]
+
+    async def test_order_kept_with_parallel_batches(self):
+        """Пачки уходят параллельно, но карточки — в исходном порядке."""
+        def suggest(n):
+            return {'content': json.dumps([{'n': 0, 'verdict': 'suggest',
+                                            'new_comment': f'Аня: правка {n}.'}],
+                                          ensure_ascii=False), 'tool_calls': []}
+        llm = FakeLLM([suggest(0), suggest(1)])
+        docs = [_doc(doc_id=f'd{i}') for i in range(9)]
+        out = await review_documents(docs, llm=llm)
+        assert [o['id'] for o in out] == ['d0', 'd8']
+
+
 class TestReviewDocuments:
     async def test_suggest_collected_ok_skipped(self):
         llm = FakeLLM([{'content': json.dumps([

@@ -46,3 +46,39 @@ async def test_gives_up_after_limit(monkeypatch):
     with pytest.raises(asyncio.TimeoutError):
         await http.get(s, '/entity/demand')
     assert s.calls == 3
+
+
+class DownSession:
+    """Первые N ответов — 503 со страницей ошибки, дальше отвечает."""
+    def __init__(self, fails):
+        self.fails, self.calls = fails, 0
+    def request(self, *a, **kw):
+        self.calls += 1
+        outer = self
+        class Ctx:
+            async def __aenter__(self):
+                class R:
+                    status = 503 if outer.calls <= outer.fails else 200
+                    headers = {}
+                    async def text(self): return '<!DOCTYPE html><html>503</html>'
+                    async def json(self): return {'rows': [1]}
+                return R()
+            async def __aexit__(self, *a): return False
+        return Ctx()
+
+
+async def test_retries_after_503(monkeypatch):
+    monkeypatch.setattr(asyncio, 'sleep', _no_wait)
+    http = MoySkladHTTP(token='t')
+    s = DownSession(fails=2)
+    assert await http.get(s, '/entity/demand') == {'rows': [1]}
+    assert s.calls == 3
+
+async def test_503_error_text_has_no_html(monkeypatch):
+    """Текст ошибки уходит владельцу в чат — HTML-страница МойСклада его ломала."""
+    monkeypatch.setattr(asyncio, 'sleep', _no_wait)
+    http = MoySkladHTTP(token='t')
+    with pytest.raises(RuntimeError) as exc:
+        await http.get(DownSession(fails=99), '/entity/demand')
+    assert '<' not in str(exc.value)
+    assert '503' in str(exc.value)

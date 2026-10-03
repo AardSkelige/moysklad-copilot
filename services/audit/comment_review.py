@@ -5,8 +5,10 @@
 [Заменить] [Оставить]. Замена пишется в МойСклад сразу (подтверждение = кнопка).
 """
 
+import asyncio
 import json
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
 
 import aiohttp
@@ -43,6 +45,48 @@ ENTITIES = {
 }
 
 _BATCH_SIZE = 8
+# пачки уходят в модель по нескольку сразу: строго по очереди 30 дней
+# оценивались почти 4 минуты, а пачки друг от друга не зависят
+_PARALLEL_BATCHES = 3
+
+# progress(сделано, всего) — чтобы владелец видел, что работа идёт
+Progress = Callable[[int, int], Awaitable[None]] | None
+
+
+async def _ask_batches(llm: LLMClient, system: str, payloads: list[list],
+                       tag: str, progress: Progress = None) -> list[list | None]:
+    """Отправить пачки в модель параллельно; вердикты вернуть в порядке пачек.
+
+    Разбор ответа — строго по порядку исходных пачек: от него зависят правила
+    вроде «заказ с двумя отгрузками правит только первая карточка».
+    None на месте пачки = модель ответила неразборчиво, пачку пропускаем."""
+    semaphore = asyncio.Semaphore(_PARALLEL_BATCHES)
+    done = 0
+
+    async def one(i: int, payload: list) -> list | None:
+        nonlocal done
+        async with semaphore:
+            try:
+                resp = await llm.chat([
+                    {'role': 'system', 'content': system},
+                    {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)},
+                ])
+                content = (resp.get('content') or '').strip()
+                arr_start, arr_end = content.find('['), content.rfind(']')
+                verdicts = json.loads(content[arr_start:arr_end + 1])
+            except Exception as e:
+                logger.warning(f'[{tag}] батч {i * _BATCH_SIZE} не разобрался: {e}')
+                verdicts = None
+        done += 1
+        if progress:
+            await progress(done, len(payloads))
+        return verdicts
+
+    return await asyncio.gather(*(one(i, p) for i, p in enumerate(payloads)))
+
+
+def _batches(docs: list[dict]) -> list[list[dict]]:
+    return [docs[i:i + _BATCH_SIZE] for i in range(0, len(docs), _BATCH_SIZE)]
 
 # стандартный комментарий отгрузки маркетплейсу с нулевыми накладными —
 # используется и в промпте LLM, и в пакетной кнопке (единственное место истины)
@@ -243,7 +287,8 @@ async def collect_documents(days: int) -> tuple[list[dict], list[str]]:
     return docs, failed
 
 
-async def review_documents(docs: list[dict], llm: LLMClient | None = None) -> list[dict]:
+async def review_documents(docs: list[dict], llm: LLMClient | None = None,
+                           progress: Progress = None) -> list[dict]:
     """Вернуть только документы с предложенной правкой (+ new_comment, reason).
 
     Отгрузки со связанным заказом идут через свой промпт (правила накладных расходов
@@ -255,35 +300,37 @@ async def review_documents(docs: list[dict], llm: LLMClient | None = None) -> li
     generic = [d for d in docs
                if d.get('kind') != 'demand'
                and not (d['entity'] == 'customerorder' and d['id'] in paired_orders)]
-    suggestions = (await _review_generic(generic, llm)
-                   + await _review_demands(demands, llm))
+    # две фазы — один общий счётчик пачек для владельца
+    total = len(_batches(generic)) + len(_batches(demands))
+    first = len(_batches(generic))
+
+    def shifted(offset: int) -> Progress:
+        if not progress:
+            return None
+        return lambda done, _: progress(offset + done, total)
+
+    suggestions = (await _review_generic(generic, llm, shifted(0))
+                   + await _review_demands(demands, llm, shifted(first)))
     # вернуть порядок исходного списка (по типам, от старых к новым)
     pos = {(d['entity'], d['id']): i for i, d in enumerate(docs)}
     suggestions.sort(key=lambda s: pos.get((s['entity'], s['id']), 0))
     return suggestions
 
 
-async def _review_generic(docs: list[dict], llm: LLMClient) -> list[dict]:
+async def _review_generic(docs: list[dict], llm: LLMClient,
+                          progress: Progress = None) -> list[dict]:
     suggestions = []
-    for start in range(0, len(docs), _BATCH_SIZE):
-        batch = docs[start:start + _BATCH_SIZE]
-        payload = [{
-            'n': i,
-            'документ': d['label'],
-            'контрагент': d['agent'],
-            'сумма_руб': d['sum_rub'],
-            'комментарий': d['comment'],
-        } for i, d in enumerate(batch)]
-        try:
-            resp = await llm.chat([
-                {'role': 'system', 'content': _SYSTEM},
-                {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)},
-            ])
-            content = (resp.get('content') or '').strip()
-            arr_start, arr_end = content.find('['), content.rfind(']')
-            verdicts = json.loads(content[arr_start:arr_end + 1])
-        except Exception as e:
-            logger.warning(f'[comments] батч {start} не разобрался: {e}')
+    batches = _batches(docs)
+    payloads = [[{
+        'n': i,
+        'документ': d['label'],
+        'контрагент': d['agent'],
+        'сумма_руб': d['sum_rub'],
+        'комментарий': d['comment'],
+    } for i, d in enumerate(batch)] for batch in batches]
+    answers = await _ask_batches(llm, _SYSTEM, payloads, 'comments', progress)
+    for batch, verdicts in zip(batches, answers):
+        if verdicts is None:
             continue
         for v in verdicts:
             if v.get('verdict') != 'suggest':
@@ -311,33 +358,26 @@ async def _review_generic(docs: list[dict], llm: LLMClient) -> list[dict]:
     return suggestions
 
 
-async def _review_demands(docs: list[dict], llm: LLMClient) -> list[dict]:
+async def _review_demands(docs: list[dict], llm: LLMClient,
+                          progress: Progress = None) -> list[dict]:
     """Отгрузки: new_comment может быть '' (очистить), new_order_comment — дополнение заказа."""
     suggestions = []
     orders_touched = set()   # заказ с двумя отгрузками правит только первая карточка
-    for start in range(0, len(docs), _BATCH_SIZE):
-        batch = docs[start:start + _BATCH_SIZE]
-        payload = [{
-            'n': i,
-            'отгрузка': d['label'],
-            'контрагент': d['agent'],
-            'сумма_руб': d['sum_rub'],
-            'накладные_расходы_руб': d['overhead_rub'],
-            'способ_доставки': d.get('delivery_method'),
-            'комментарий_отгрузки': d['comment'],
-            'заказ': f'Заказ покупателя №{d["order_name"]}',
-            'комментарий_заказа': d['order_comment'],
-        } for i, d in enumerate(batch)]
-        try:
-            resp = await llm.chat([
-                {'role': 'system', 'content': _DEMAND_SYSTEM},
-                {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)},
-            ])
-            content = (resp.get('content') or '').strip()
-            arr_start, arr_end = content.find('['), content.rfind(']')
-            verdicts = json.loads(content[arr_start:arr_end + 1])
-        except Exception as e:
-            logger.warning(f'[comments] батч отгрузок {start} не разобрался: {e}')
+    batches = _batches(docs)
+    payloads = [[{
+        'n': i,
+        'отгрузка': d['label'],
+        'контрагент': d['agent'],
+        'сумма_руб': d['sum_rub'],
+        'накладные_расходы_руб': d['overhead_rub'],
+        'способ_доставки': d.get('delivery_method'),
+        'комментарий_отгрузки': d['comment'],
+        'заказ': f'Заказ покупателя №{d["order_name"]}',
+        'комментарий_заказа': d['order_comment'],
+    } for i, d in enumerate(batch)] for batch in batches]
+    answers = await _ask_batches(llm, _DEMAND_SYSTEM, payloads, 'comments', progress)
+    for batch, verdicts in zip(batches, answers):
+        if verdicts is None:
             continue
         for v in verdicts:
             try:
@@ -515,18 +555,20 @@ async def collect_dot_fixes(days: int) -> list[dict]:
     return unique
 
 
-async def apply_dot_fixes(items: list[dict]) -> int:
-    """Записать точки пачкой; вернуть число обновлённых документов."""
+async def apply_batch_comments(items: list[dict], progress: Progress = None) -> int:
+    """Записать комментарии пачкой (точки, маркетплейсы); вернуть число обновлённых."""
     client = MoySkladAuditClient()
     done = 0
     async with new_session() as session:
-        for item in items:
+        for n, item in enumerate(items, 1):
             try:
                 await client.update_entity(session, item['entity'], item['id'],
                                            {'description': item['new_comment']})
                 done += 1
             except Exception as e:
-                logger.warning(f'[comments] точка не записалась в {item["label"]}: {e}')
+                logger.warning(f'[comments] комментарий не записался в {item["label"]}: {e}')
+            if progress:
+                await progress(n, len(items))
     return done
 
 
@@ -563,22 +605,6 @@ async def collect_marketplace_zero_fixes(days: int) -> list[dict]:
                              f'({agent_name})',
                     'comment': '', 'new_comment': DEMAND_MARKETPLACE_ZERO_COMMENT})
     return out
-
-
-async def apply_marketplace_zero_fixes(items: list[dict]) -> int:
-    """Записать стандартный комментарий пачкой; вернуть число обновлённых документов."""
-    client = MoySkladAuditClient()
-    done = 0
-    async with new_session() as session:
-        for item in items:
-            try:
-                await client.update_entity(session, item['entity'], item['id'],
-                                           {'description': item['new_comment']})
-                done += 1
-            except Exception as e:
-                logger.warning(f'[comments] маркетплейс-комментарий не записался в '
-                               f'{item["label"]}: {e}')
-    return done
 
 
 async def apply_comment(entity: str, entity_id: str, new_comment: str):
@@ -694,31 +720,24 @@ async def collect_finance_documents(days: int = 0) -> tuple[list[dict], list[str
     return docs, failed
 
 
-async def review_finance_documents(docs: list[dict], llm: LLMClient | None = None) -> list[dict]:
+async def review_finance_documents(docs: list[dict], llm: LLMClient | None = None,
+                                   progress: Progress = None) -> list[dict]:
     llm = llm or LLMClient()
     suggestions = []
-    for start in range(0, len(docs), _BATCH_SIZE):
-        batch = docs[start:start + _BATCH_SIZE]
-        payload = [{
-            'n': i,
-            'документ': d['label'],
-            'контрагент': d['agent'],
-            'сумма_руб': d['sum_rub'],
-            'назначение': d['purpose'],
-            'комментарий': d['comment'],
-            'связанные_документы': d['linked'],
-            'назначение_авто_не_менять': bool(_PROTECTED_PURPOSE.match(d['purpose'])),
-        } for i, d in enumerate(batch)]
-        try:
-            resp = await llm.chat([
-                {'role': 'system', 'content': _FIN_SYSTEM},
-                {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)},
-            ])
-            content = (resp.get('content') or '').strip()
-            arr_start, arr_end = content.find('['), content.rfind(']')
-            verdicts = json.loads(content[arr_start:arr_end + 1])
-        except Exception as e:
-            logger.warning(f'[fin-comments] батч {start} не разобрался: {e}')
+    batches = _batches(docs)
+    payloads = [[{
+        'n': i,
+        'документ': d['label'],
+        'контрагент': d['agent'],
+        'сумма_руб': d['sum_rub'],
+        'назначение': d['purpose'],
+        'комментарий': d['comment'],
+        'связанные_документы': d['linked'],
+        'назначение_авто_не_менять': bool(_PROTECTED_PURPOSE.match(d['purpose'])),
+    } for i, d in enumerate(batch)] for batch in batches]
+    answers = await _ask_batches(llm, _FIN_SYSTEM, payloads, 'fin-comments', progress)
+    for batch, verdicts in zip(batches, answers):
+        if verdicts is None:
             continue
         for v in verdicts:
             try:

@@ -25,6 +25,7 @@ from services.audit.fix_service import (
 )
 from shared import session_scope
 from shared.constants import CallbackData, CallbackPrefix
+from shared.errors import user_error_text
 from shared.filters import IsAuditOwnerFilter
 from shared.states import AuditState
 
@@ -62,7 +63,7 @@ async def _process_text(message: Message, state: FSMContext, user_text: str):
             await thinking.delete()
         except Exception:
             pass
-        await message.answer(f'❌ Ошибка агента: {e}', reply_markup=_exit_keyboard())
+        await message.answer(f'❌ Ошибка агента: {user_error_text(e)}', reply_markup=_exit_keyboard())
         return
     try:
         await thinking.delete()
@@ -138,7 +139,7 @@ async def _transcribe_voice(message: Message) -> str | None:
         text = await VoiceService().transcribe(buf.getvalue())
     except Exception as e:
         logger.exception('audit voice transcription failed')
-        await message.answer(f'❌ Не удалось расшифровать голос: {e}')
+        await message.answer(f'❌ Не удалось расшифровать голос: {user_error_text(e)}')
         return None
     if not text:
         await message.answer('Не расслышал — повтори, пожалуйста.')
@@ -219,7 +220,7 @@ async def on_fix_apply(callback: CallbackQuery, state: FSMContext):
         results = await ErrorFixService().apply(preview)
     except Exception as e:
         logger.exception('fix apply failed')
-        await callback.message.answer(f'❌ Не удалось применить: {e}',
+        await callback.message.answer(f'❌ Не удалось применить: {user_error_text(e)}',
                                       reply_markup=_exit_keyboard())
         await state.set_state(AuditState.discussing)
         return

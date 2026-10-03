@@ -135,6 +135,9 @@ class AuditRunner:
                 if raw.ui_link and stored.get('ui_link') != raw.ui_link:
                     stored['ui_link'] = raw.ui_link
                     changed = True
+                # подпись идёт в паре со ссылкой: ссылка на документ под именем товара путает
+                if raw.entity_name and existing.entity_name != raw.entity_name:
+                    existing.entity_name = raw.entity_name
                 # факты разъехались с сохранёнными — правили комментарий, обновили правила
                 # проверки или сами детекторы стали давать больше данных. Вердикт LLM
                 # опирался на старые факты, значит устарел: обновляем и переанализируем
