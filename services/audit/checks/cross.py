@@ -1,11 +1,13 @@
 """Сквозные проверки: ретро-правки складских документов и зависшие черновики."""
 
+import re
 from datetime import datetime, timedelta
 
 from core import config
 from core.logger import logger
 from services.audit.context import AuditContext, format_moment, linked_documents, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
+from services.audit.team_context import CANONICAL_NAMES, SHARED_LOGINS
 
 # Складские документы, где поздняя правка бьёт по остаткам и FIFO прошлых дат.
 # Заказы покупателей и отгрузки намеренно исключены — их ретро-правки норма процесса.
@@ -87,6 +89,62 @@ def last_meaningful_moment(events: list[dict]) -> str | None:
     return max(moments) if moments else None
 
 
+_SIGNATURE = re.compile(r'^\s*([А-ЯЁ][а-яё]+)\s*:')
+
+
+def comment_author(text: str | None) -> str | None:
+    """Имя из подписи комментария («Лена: …») — только из списка команды,
+    чтобы «Причина: …» не превратилась в автора."""
+    m = _SIGNATURE.match(text or '')
+    return m.group(1) if m and m.group(1) in CANONICAL_NAMES else None
+
+
+def editor_login(event: dict) -> str | None:
+    """Логин автора правки; под общим логином автора по нему не узнать."""
+    uid = event.get('uid') or ''
+    return None if not uid or uid in SHARED_LOGINS else uid
+
+
+def _href(ref) -> str:
+    return (((ref or {}).get('meta') or {}).get('href') or '').split('?')[0] \
+        if isinstance(ref, dict) else ''
+
+
+def inventory_days(inventories: list[dict]) -> set[tuple[str, str]]:
+    """(склад, день), когда на складе шла инвентаризация (по дате и по созданию)."""
+    out = set()
+    for inv in inventories:
+        if inv.get('applicable') is False:
+            continue
+        store = _href(inv.get('store'))
+        for moment in (inv.get('moment'), inv.get('created')):
+            if store and moment:
+                out.add((store, moment[:10]))
+    return out
+
+
+def edited_during_inventory(events: list[dict], doc_store: str,
+                            days: set[tuple[str, str]]) -> bool:
+    """Все значимые правки сделаны в день инвентаризации того же склада.
+
+    Так выглядит сверка: пересчитали склад и тут же чинят старые документы
+    (живой кейс 04.10: коробки были оприходованы на «Производство» вместо
+    «Хоз товаров» — три документа перенесли по ходу инвентаризации). Это
+    исправление ошибки, а не ретро-правка, ради которой стоит будить владельца."""
+    meaningful = [ev for ev in events
+                  if not (meaningful_fields(ev.get('diff') or {}) <= _COSMETIC_FIELDS)]
+    if not meaningful:
+        return False
+    for ev in meaningful:
+        day = (ev.get('moment') or '')[:10]
+        store_change = (ev.get('diff') or {}).get('store') or {}
+        stores = {doc_store, _href(store_change.get('oldValue')),
+                  _href(store_change.get('newValue'))} - {''}
+        if not any((store, day) in days for store in stores):
+            return False
+    return True
+
+
 def _position_line(change: dict) -> str:
     """Строка позиции из diff — по-человечески, а не обрезанным JSON.
 
@@ -144,7 +202,8 @@ def _slim_audit_events(events: list[dict], limit: int = 5,
         out.append({
             'moment': moment,
             'type': ev.get('eventType'),
-            'who': ev.get('uid', ''),   # кто правил — иначе LLM гадает по комментарию
+            # логин автора; None — правили под общим логином, автор только по подписи
+            'who': editor_login(ev),
             'diff': slim_diff,
         })
     return out
@@ -165,6 +224,11 @@ class RetroEditCheck(CheckSpec):
         threshold = timedelta(hours=config.AUDIT_RETRO_EDIT_HOURS)
         out = []
         diffs_budget = _MAX_AUDIT_DIFFS
+        # с запасом в двое суток: инвентаризацию могли завести до начала окна скана
+        inventories = await ctx.client.list_entities(
+            ctx.session, 'inventory',
+            filters=f'updated>={format_moment(parse_moment(window_start) - timedelta(days=2))}')
+        stocktaking = inventory_days(inventories)
         for entity, label in _STOCK_ENTITIES.items():
             docs = await ctx.client.list_entities(
                 ctx.session, entity,
@@ -200,6 +264,9 @@ class RetroEditCheck(CheckSpec):
                         diffs_budget -= 1
                         if is_cosmetic(raw_events):
                             continue   # переписали только комментарий — на учёт не влияет
+                        if entity != 'inventory' and edited_during_inventory(
+                                raw_events, _href(d.get('store')), stocktaking):
+                            continue   # чинили по итогам пересчёта склада
                         events = _slim_audit_events(raw_events)
                         salt_moment = (last_meaningful_moment(raw_events) or d['updated'])[:10]
                     except Exception:
@@ -221,6 +288,7 @@ class RetroEditCheck(CheckSpec):
                         'updated': (d.get('updated') or '')[:16],
                         'gap_days': round(gap.total_seconds() / 86400, 1),
                         'description': (d.get('description') or '')[:300],
+                        'signed_by': comment_author(d.get('description')),
                         'linked_documents': linked_documents(d),
                         'changes_after_doc_date': events,
                         # без флага пустая история читается как «правок не было» —

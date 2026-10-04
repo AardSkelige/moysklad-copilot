@@ -710,6 +710,76 @@ class TestRetroEdit:
         assert fp1 != fp2
 
 
+class TestRetroEditStocktaking:
+    """Живой кейс 04.10: в ходе инвентаризации коробок на «Хоз товарах» три старых
+    документа перенесли со склада «Производство» — это исправление, а не ретро-правка."""
+
+    HOZ = f'{MS}/entity/store/hoz'
+    PROD = f'{MS}/entity/store/prod'
+
+    def _enter(self):
+        return _doc('enter', 'e26', '00026', '2026-07-25 09:57:00',
+                    updated='2026-10-04 19:53:26', created='2026-07-25 09:57:00',
+                    store={'meta': {'href': self.HOZ}})
+
+    def _store_event(self, moment='2026-10-04 19:53:26'):
+        return [{'moment': moment, 'eventType': 'update', 'uid': 'admin@x',
+                 'diff': {'store': {'oldValue': {'meta': {'href': self.PROD}, 'name': 'Производство'},
+                                    'newValue': {'meta': {'href': self.HOZ}, 'name': 'Хоз товары'}}}}]
+
+    def _inventory(self, store, day='2026-10-04'):
+        return _doc('inventory', 'i8', '00008', f'{day} 18:56:00',
+                    created=f'{day} 18:56:33', store={'meta': {'href': store}})
+
+    async def test_edit_during_inventory_of_same_store_skipped(self):
+        ctx = FakeContext(FakeClient({'enter': [self._enter()],
+                                      'inventory': [self._inventory(self.HOZ)]},
+                                     audit_events=self._store_event()))
+        assert await RetroEditCheck().detect(ctx, None) == []
+
+    async def test_inventory_of_other_store_does_not_excuse(self):
+        other = f'{MS}/entity/store/other'
+        ctx = FakeContext(FakeClient({'enter': [self._enter()],
+                                      'inventory': [self._inventory(other)]},
+                                     audit_events=self._store_event()))
+        assert len(await RetroEditCheck().detect(ctx, None)) == 1
+
+    async def test_inventory_on_other_day_does_not_excuse(self):
+        ctx = FakeContext(FakeClient({'enter': [self._enter()],
+                                      'inventory': [self._inventory(self.HOZ, day='2026-09-20')]},
+                                     audit_events=self._store_event()))
+        assert len(await RetroEditCheck().detect(ctx, None)) == 1
+
+
+class TestEditAuthor:
+    async def test_shared_login_hidden_author_from_signature(self, monkeypatch):
+        """Под общим логином автора по логину не узнать — только по подписи."""
+        from services.audit.checks import cross
+        from services.audit.team_context import CANONICAL_NAMES
+        monkeypatch.setattr(cross, 'SHARED_LOGINS', ('team@shared',))
+        name = CANONICAL_NAMES[0]
+        doc = _doc('enter', 'e40', '00040', '2026-09-26 10:00:00',
+                   updated='2026-10-04 19:51:26', created='2026-09-26 10:00:00',
+                   description=f'{name}: закупила коробки.')
+        events = [{'moment': '2026-10-04 19:51:26', 'eventType': 'update', 'uid': 'team@shared',
+                   'diff': {'positions': [{'oldValue': {'assortment': {'name': 'Короб'},
+                                                        'quantity': 2.0, 'price': 5.0}}]}}]
+        found = await RetroEditCheck().detect(
+            FakeContext(FakeClient({'enter': [doc]}, audit_events=events)), None)
+        assert found[0].payload['signed_by'] == name
+        assert found[0].payload['changes_after_doc_date'][0]['who'] is None
+
+    async def test_personal_login_kept(self, monkeypatch):
+        from services.audit.checks import cross
+        monkeypatch.setattr(cross, 'SHARED_LOGINS', ('team@shared',))
+        assert cross.editor_login({'uid': 'yana@company'}) == 'yana@company'
+
+    async def test_signature_only_from_team_names(self):
+        from services.audit.checks.cross import comment_author
+        assert comment_author('Причина: бесплатно') is None
+        assert comment_author('') is None
+
+
 class TestOverheadPaymentMatching:
     def _demand(self, name, moment, overhead):
         return _doc('demand', f'd{name}', name, moment, sum=8847000,

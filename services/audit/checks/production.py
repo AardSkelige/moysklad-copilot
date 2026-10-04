@@ -10,6 +10,7 @@ from core import config
 from core.logger import logger
 from services.audit.checks.cross import (
     _slim_audit_events,
+    comment_author,
     events_after,
     last_meaningful_moment,
     meaningful_fields,
@@ -109,6 +110,7 @@ class ProductionRetroEditCheck(CheckSpec):
                     'gap_days_after_completion': round(gap.total_seconds() / 86400, 1),
                     'state': (d.get('state') or {}).get('name', ''),
                     'description': (d.get('description') or '')[:300],
+                    'signed_by': comment_author(d.get('description')),
                     'changes_after_completion': events,
                     'history_checked': history_checked,
                 },
