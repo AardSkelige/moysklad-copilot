@@ -99,6 +99,28 @@ class MoySkladAuditClient:
         )
         return (data or {}).get('rows', [])
 
+    async def production_materials(
+        self, session: aiohttp.ClientSession, task_id: str
+    ) -> list[dict]:
+        """Материалы ПЗ: количество в техкарте, умноженное на объём производства."""
+        data = await self.http.get(
+            session, f'/entity/productiontask/{task_id}/productionrows', 'expand=processingPlan')
+        out: list[dict] = []
+        for row in (data or {}).get('rows', []):
+            plan_href = row['processingPlan']['meta']['href'].split('?')[0]
+            plan_path = plan_href.split('/entity/', 1)[1]
+            mats = await self.http.get(
+                session, f'/entity/{plan_path}/materials', 'expand=assortment')
+            for m in (mats or {}).get('rows', []):
+                a = m['assortment']
+                out.append({
+                    'href': a['meta']['href'].split('?')[0],
+                    'code': a.get('code'),
+                    'name': a.get('name'),
+                    'need': m.get('quantity', 0) * row.get('productionVolume', 0),
+                })
+        return out
+
     # --- запись (только из ErrorFixService после подтверждения) ---
 
     async def update_entity(

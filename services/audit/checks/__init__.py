@@ -12,7 +12,11 @@ from services.audit.checks.products import (
     ProductInNonLeafFolderCheck,
     RootProductCheck,
 )
-from services.audit.checks.purchases import OrderSupplyMismatchCheck, SupplyZeroPriceCheck
+from services.audit.checks.purchases import (
+    OrderSupplyMismatchCheck,
+    OrderSupplyOverdueCheck,
+    SupplyZeroPriceCheck,
+)
 from services.audit.checks.sales import (
     DemandNoOverheadCheck, DemandOverheadPaymentCheck, DemandZeroCheck,
 )
@@ -35,6 +39,7 @@ def build_registry() -> list[CheckSpec]:
     return [
         SupplyZeroPriceCheck(),
         OrderSupplyMismatchCheck(),
+        OrderSupplyOverdueCheck(),
         PaymentDuplicateCheck(),
         CounterpartyBalanceCheck(),
         DuplicateCounterpartyCheck(),

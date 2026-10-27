@@ -389,14 +389,26 @@ class ProductCodeSchemeCheck(CheckSpec):
             fid = folder['meta']['href'].split('/')[-1]
             by_folder.setdefault(fid, []).append(p)
 
+        # архив занимает коды наравне с живыми товарами
+        archived = await ctx.cached_list(
+            'products_archived', 'product', filters='archived=true', max_rows=3000)
+        everything = {p['id']: p for p in products + archived}.values()
+
         # дубли кодов по всему справочнику — сигнал сам по себе, папка ни при чём
         code_owners: dict[str, list[dict]] = {}
-        for p in products:
-            if p.get('archived'):
-                continue
+        for p in everything:
             code = (p.get('code') or '').strip()
             if code:
                 code_owners.setdefault(code, []).append(p)
+
+        # у каждого префикса своя сквозная нумерация
+        last_number: dict[str, int] = {}
+        width: dict[str, int] = {}
+        for p in everything:
+            prefix, _, num = (p.get('code') or '').strip().partition('-')
+            if num.isdigit():
+                last_number[prefix] = max(last_number.get(prefix, 0), int(num))
+                width[prefix] = max(width.get(prefix, 0), len(num))
 
         out = []
         seen_dup_codes = set()
@@ -412,6 +424,18 @@ class ProductCodeSchemeCheck(CheckSpec):
                                 > sum(prefixes.values()) - prefixes.most_common(1)[0][1])
             main_prefix = prefixes.most_common(1)[0][0] if has_majority else None
 
+            suggested: dict[str, str] = {}
+            if main_prefix is not None:
+                misfits = sorted(
+                    (p for p in items
+                     if '-' in (p.get('code') or '')
+                     and p['code'].strip().split('-')[0] != main_prefix),
+                    key=lambda p: p['code'].strip())
+                for p in misfits:
+                    last_number[main_prefix] = last_number.get(main_prefix, 0) + 1
+                    n = last_number[main_prefix]
+                    suggested[p['id']] = f'{main_prefix}-{n:0{width.get(main_prefix, 3)}d}'
+
             for p in items:
                 code = (p.get('code') or '').strip()
                 dupes = code_owners.get(code, [])
@@ -424,7 +448,8 @@ class ProductCodeSchemeCheck(CheckSpec):
                         entity_name=f'{p.get("name", "?")} — дубль кода {code}',
                         severity=Severity.WARNING,
                         payload={'issue': 'duplicate_code', 'code': code,
-                                 'products': [d.get('name') for d in dupes]},
+                                 'products': [d.get('name') + (' (архив)' if d.get('archived') else '')
+                                              for d in dupes]},
                         fingerprint_salt=f'dup:{code}',
                         ui_link=(p.get('meta') or {}).get('uuidHref', ''),
                     ))
@@ -434,7 +459,6 @@ class ProductCodeSchemeCheck(CheckSpec):
                 prefix = code.split('-')[0] if '-' in code else None
                 if prefix is None or prefix == main_prefix:
                     continue
-                suffix = code.split('-', 1)[1] if '-' in code else None
                 out.append(RawFinding(
                     entity_type='product',
                     entity_id=p['id'],
@@ -447,8 +471,7 @@ class ProductCodeSchemeCheck(CheckSpec):
                         'code': code,
                         'folder': folder_name,
                         'expected_prefix': main_prefix,
-                        'suggested_code': (f'{main_prefix}-{suffix}'
-                                           if suffix and suffix.isdigit() else None),
+                        'suggested_code': suggested.get(p['id']),
                     },
                     fingerprint_salt=code,
                     ui_link=(p.get('meta') or {}).get('uuidHref', ''),
@@ -459,7 +482,8 @@ class ProductCodeSchemeCheck(CheckSpec):
         if payload.get('issue') == 'duplicate_code':
             names = ', '.join(f'«{n}»' for n in payload.get('products', []))
             return f'Код {payload.get("code")} присвоен нескольким товарам: {names}.'
-        tail = (f' По схеме папки должно быть {payload["suggested_code"]}.'
+        tail = (f' Следующий свободный код в серии {payload.get("expected_prefix")}-: '
+                f'{payload["suggested_code"]}.'
                 if payload.get('suggested_code') else '')
         return (f'Товар «{payload.get("product")}» лежит в папке «{payload.get("folder")}», '
                 f'где у остальных товаров код начинается на {payload.get("expected_prefix")}-, '

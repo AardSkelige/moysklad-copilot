@@ -214,6 +214,43 @@ class TestRunnerLifecycle:
             row = (await s.execute(select(Finding))).scalar_one()
         assert row.status == FindingStatus.RESOLVED
 
+    async def test_failed_check_keeps_its_findings(self, audit_env):
+        # МойСклад не ответил, проверка ничего не видела, значит проблема не ушла
+        runner_module, factory = audit_env
+
+        class BrokenCheck(StubCheck):
+            async def detect(self, ctx, since):
+                raise ConnectionError('МойСклад не ответил')
+
+        await _run(runner_module, [StubCheck([_raw('doc1')])], StubAnalyst())
+        await _run(runner_module, [BrokenCheck([])], StubAnalyst())
+        async with factory() as s:
+            row = (await s.execute(select(Finding))).scalar_one()
+        assert row.status == FindingStatus.NEW
+
+    async def test_resolved_finding_reopens_when_problem_returns(self, audit_env):
+        runner_module, factory = audit_env
+        await _run(runner_module, [StubCheck([_raw('doc1')])], StubAnalyst())
+        async with factory() as s:
+            first_id = (await s.execute(select(Finding))).scalar_one().id
+        await _run(runner_module, [StubCheck([])], StubAnalyst())
+        new = await _run(runner_module, [StubCheck([_raw('doc1')])], StubAnalyst())
+        assert len(new) == 1
+        async with factory() as s:
+            row = (await s.execute(select(Finding))).scalar_one()
+        assert row.status == FindingStatus.NEW
+        assert row.id == first_id   # кнопки в старых сообщениях ведут на ту же запись
+
+    async def test_fixed_finding_reopens_when_problem_returns(self, audit_env):
+        runner_module, factory = audit_env
+        await _run(runner_module, [StubCheck([_raw('doc1')])], StubAnalyst())
+        async with factory() as s:
+            row = (await s.execute(select(Finding))).scalar_one()
+            row.status = FindingStatus.FIXED
+            await s.commit()
+        new = await _run(runner_module, [StubCheck([_raw('doc1')])], StubAnalyst())
+        assert len(new) == 1
+
     async def test_run_recorded(self, audit_env):
         runner_module, factory = audit_env
         await _run(runner_module, [StubCheck([_raw()])], StubAnalyst())

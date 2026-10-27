@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from services.audit.context import AuditContext, format_moment, is_marketplace, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
+from services.audit.team_context import SETTLED_SUPPLY_GAPS
 
 _DUPLICATE_WINDOW_DAYS = 14
 
@@ -222,9 +223,23 @@ class CounterpartyBalanceCheck(CheckSpec):
                 slot = acc.setdefault(href, {
                     'agent': (agent or {}).get('name', '?'),
                     'supplies': 0, 'paid_out': 0, 'demands': 0, 'paid_in': 0,
-                    'docs': [],
+                    'docs': [], 'unpaid_supplies': [],
                 })
-                slot[key] += d.get('sum', 0)
+                amount = d.get('sum', 0)
+                unpaid = amount - (d.get('payedSum') or 0)
+                if entity == 'supply' and unpaid > 0:
+                    settled = SETTLED_SUPPLY_GAPS.get(d.get('name'))
+                    if settled:
+                        amount -= unpaid
+                    order_id = ((d.get('purchaseOrder') or {}).get('meta') or {}).get(
+                        'href', '').split('/')[-1]
+                    slot['unpaid_supplies'].append({
+                        'supply': f'Приёмка №{d.get("name")} от {d.get("moment", "")[:10]}',
+                        'unpaid_rub': round(unpaid / 100, 2),
+                        'order_id': order_id,
+                        'settled_by_owner': settled,
+                    })
+                slot[key] += amount
                 slot['docs'].append(f'{entity} №{d.get("name")} {d.get("moment", "")[:10]} '
                                     f'{d.get("sum", 0) / 100:.2f}')
 
@@ -331,6 +346,8 @@ class CounterpartyBalanceCheck(CheckSpec):
                 'comment': (o.get('description') or '')[:200],
             })
 
+        order_comments = {o['id']: (o.get('description') or '')[:200] for o in orders}
+
         out = []
         for href, s in acc.items():
             if not s['supplies'] and not s['demands']:
@@ -395,6 +412,12 @@ class CounterpartyBalanceCheck(CheckSpec):
                         if on_commission else None),
                     'unpaid_commission_reports': unpaid_reports.get(href, [])[:5],
                     'recent_docs': s['docs'][:15],
+                    'unpaid_supplies': [
+                        {'supply': u['supply'], 'unpaid_rub': u['unpaid_rub'],
+                         'order_comment': order_comments.get(u['order_id']) or None,
+                         'settled_by_owner': u['settled_by_owner']}
+                        for u in s['unpaid_supplies'][:10]
+                    ],
                     'open_purchase_orders': [
                         {'order': p['order'],
                          'awaiting_delivery_rub': round(p['awaiting_kopecks'] / 100, 2)}
@@ -422,7 +445,13 @@ class CounterpartyBalanceCheck(CheckSpec):
                              'goods_on_partner_shelf_rub — наш товар у него на реализации, '
                              'это тоже НЕ долг и не потеря. Неоплаченные отчёты перечислены '
                              'в unpaid_commission_reports: свежий отчёт (до ~2 недель) — '
-                             'норма, выплата ещё в пути; давний — повод напомнить.'),
+                             'норма, выплата ещё в пути; давний — повод напомнить. '
+                             'Долг поставщику раскладывай по unpaid_supplies: называй '
+                             'конкретную приёмку и сумму недоплаты, а не перебирай документы. '
+                             'order_comment — комментарий к заказу этой приёмки, часто '
+                             'объясняет недоплату (доставка отдельным счётом). '
+                             'settled_by_owner — владелец знает об этой недоплате и решил '
+                             'её не править, в баланс она уже не входит.'),
                 },
                 # изменение баланса = новый сигнал; стабильный — молчит после ack
                 fingerprint_salt=f'{supplier_balance}|{customer_balance}',

@@ -15,6 +15,7 @@ from services.audit.checks.cross import (
     last_meaningful_moment,
     meaningful_fields,
 )
+from services.audit.checks.purchases import PLAN_SLACK
 from services.audit.context import AuditContext, format_moment, parse_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
 
@@ -125,8 +126,32 @@ class ProductionRetroEditCheck(CheckSpec):
                 f'ломает остатки сырья и готовой продукции.')
 
 
+async def _awaited_supplies(ctx: AuditContext) -> dict[str, list[dict]]:
+    """Для каждого товара заказы поставщику, по которым он ещё не принят."""
+    orders = await ctx.cached_list(
+        'purchaseorders_scan', 'purchaseorder',
+        filters=f'moment>={ctx.scan_since_moment};applicable=true', order='moment,desc')
+    out: dict[str, list[dict]] = {}
+    for o in orders:
+        if o.get('shippedSum', 0) >= o.get('sum', 0):
+            continue
+        planned = (o.get('deliveryPlannedMoment') or '')[:19] or None
+        for p in await ctx.client.get_positions(ctx.session, 'purchaseorder', o['id']):
+            if p.get('shipped', 0) >= p.get('quantity', 0):
+                continue
+            href = p['assortment']['meta']['href'].split('?')[0]
+            out.setdefault(href, []).append({'order': o['name'], 'planned': planned})
+    return out
+
+
+def _arrives_in_time(order: dict, now: datetime) -> bool:
+    return bool(order['planned']) and now <= datetime.fromisoformat(order['planned']) + PLAN_SLACK
+
+
 class ProductionStuckCheck(CheckSpec):
     """ПЗ, которое не «Готово» дольше порога (кейс №00047 — «Ожидание» 54 дня)."""
+
+    # молчим, только если весь недостающий материал едет по заказу и дата не прошла
 
     id = 'production_stuck'
     section = Section.PRODUCTION
@@ -142,6 +167,7 @@ class ProductionStuckCheck(CheckSpec):
             max_rows=300,
         )
         out = []
+        awaited = None
         for d in docs:
             state = ((d.get('state') or {}).get('name') or '').lower()
             if state in _DONE_STATES:
@@ -152,6 +178,24 @@ class ProductionStuckCheck(CheckSpec):
                 continue
             if age < config.AUDIT_PRODUCTION_STUCK_DAYS:
                 continue
+            stock = await ctx.stock_fifo_map()
+            short, in_stock = [], []
+            for m in await ctx.client.production_materials(ctx.session, d['id']):
+                have = stock.get(m['href'], (0, 0))[1]
+                label = f'{m["code"]} {m["name"]}' if m.get('code') else m['name']
+                if have >= m['need']:
+                    in_stock.append(label)
+                else:
+                    short.append({'href': m['href'], 'material': label,
+                                  'need': m['need'], 'in_stock': have})
+            if short:
+                if awaited is None:
+                    awaited = await _awaited_supplies(ctx)
+                for s in short:
+                    s['awaited_orders'] = awaited.get(s.pop('href'), [])
+                if all(any(_arrives_in_time(o, ctx.now) for o in s['awaited_orders'])
+                       for s in short):
+                    continue
             out.append(RawFinding(
                 entity_type='productiontask',
                 entity_id=d['id'],
@@ -163,11 +207,20 @@ class ProductionStuckCheck(CheckSpec):
                     'age_days': age,
                     'applicable': d.get('applicable'),
                     'description': (d.get('description') or '')[:300],
+                    'short_materials': short,
+                    'materials_in_stock': in_stock,
                 },
                 fingerprint_salt='',
             ))
         return out
 
     def explain(self, payload: dict) -> str:
-        return (f'ПЗ в статусе «{payload.get("state")}» уже {payload.get("age_days")} дн. '
-                f'Довести до «Готово» или закрыть/удалить.')
+        text = f'ПЗ в статусе «{payload.get("state")}» уже {payload.get("age_days")} дн.'
+        short = payload.get('short_materials') or []
+        if short:
+            text += ' Не хватает: ' + '; '.join(
+                f'{s["material"]} (нужно {s["need"]:g}, на складе {s["in_stock"]:g})'
+                for s in short) + '.'
+        elif payload.get('materials_in_stock'):
+            text += ' Все материалы на складе есть.'
+        return text + ' Довести до «Готово» или закрыть/удалить.'

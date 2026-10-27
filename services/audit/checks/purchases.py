@@ -8,7 +8,10 @@ from services.audit.context import (
     is_free_supplier,
     linked_documents,
 )
+from services.audit.humanize import format_rub
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
+
+PLAN_SLACK = timedelta(days=2)   # поставщики опаздывают на день-два от плановой даты
 
 
 def _slim_doc(d: dict) -> dict:
@@ -84,9 +87,6 @@ class OrderSupplyMismatchCheck(CheckSpec):
     section = Section.PURCHASES
     title = 'Заказ поставщику расходится с приёмками/оплатой'
 
-    # Статусы «поставка ещё в пути» — недопоставка в них норма, а не сигнал
-    _AWAITING_MARKERS = ('заказан', 'ожидан', 'в пути', 'новый')
-
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
         filters = (f'updated>={format_moment(since)}' if since
                    else f'moment>={ctx.scan_since_moment}')
@@ -97,24 +97,16 @@ class OrderSupplyMismatchCheck(CheckSpec):
             order='moment,desc',
         )
         out = []
-        grace = ctx.now - timedelta(days=7)   # свежим заказам даём время на приёмку
         for d in docs:
             total = d.get('sum', 0)
             shipped = d.get('shippedSum', 0)
             payed = d.get('payedSum', 0)
-            moment = d.get('moment', '')[:19]
-            is_old = moment < format_moment(grace)
             state = ((d.get('state') or {}).get('name') or '').strip()
-            awaiting = any(m in state.lower() for m in self._AWAITING_MARKERS)
             problems = []
-            if total and shipped < total and is_old and not awaiting:
-                problems.append('приёмки меньше заказа')
             if total and shipped > total:
                 problems.append('принято больше, чем заказано')
             if payed > total:
                 problems.append('оплачено больше суммы заказа')
-            if total and not d.get('supplies') and is_old and not awaiting:
-                problems.append('нет ни одной приёмки')
             if not problems:
                 continue
             out.append(RawFinding(
@@ -137,3 +129,81 @@ class OrderSupplyMismatchCheck(CheckSpec):
 
     def explain(self, payload: dict) -> str:
         return 'Суммы заказа, приёмок и оплат не сходятся: ' + ', '.join(payload.get('signals', []))
+
+
+class OrderSupplyOverdueCheck(CheckSpec):
+    """Заказ принят не полностью, а плановая дата приёмки прошла или не указана."""
+
+    id = 'order_supply_overdue'
+    section = Section.PURCHASES
+    title = 'Поставка по заказу не принята в срок'
+    default_severity = Severity.WARNING
+    supports_incremental = False   # срок истекает без правки документа
+    llm_triage = False   # дата и суммы из документа, судить нечего
+
+    _NO_PLAN_GRACE = timedelta(days=3)
+    # статус ожидания спасает только заказ без плановой даты
+    _AWAITING_MARKERS = ('заказан', 'ожидан', 'в пути', 'новый')
+
+    async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
+        docs = await ctx.client.list_entities(
+            ctx.session, 'purchaseorder',
+            filters=f'moment>={ctx.scan_since_moment};applicable=true',
+            expand='agent,state',
+            order='moment,desc',
+        )
+        out = []
+        for d in docs:
+            total = d.get('sum', 0)
+            shipped = d.get('shippedSum', 0)
+            if not total or shipped >= total:
+                continue
+            state = ((d.get('state') or {}).get('name') or '').strip()
+            planned = (d.get('deliveryPlannedMoment') or '')[:19]
+            if not planned and any(m in state.lower() for m in self._AWAITING_MARKERS):
+                continue
+            if planned:
+                planned_at = datetime.fromisoformat(planned)
+                if ctx.now <= planned_at + PLAN_SLACK:
+                    continue
+                overdue_days = (ctx.now - planned_at).days
+                severity = Severity.IMPORTANT
+            else:
+                if ctx.now <= datetime.fromisoformat(d['moment'][:19]) + self._NO_PLAN_GRACE:
+                    continue
+                overdue_days = None
+                severity = self.default_severity
+            out.append(RawFinding(
+                entity_type='purchaseorder',
+                entity_id=d['id'],
+                entity_href=d['meta']['href'],
+                entity_name=f'Заказ поставщику №{d["name"]} от {d["moment"][:10]}',
+                severity=severity,
+                payload={
+                    'doc': _slim_doc(d),
+                    'status': state or None,
+                    'shipped_kopecks': shipped,
+                    'supplies_count': len(d.get('supplies') or []),
+                    'planned_delivery': planned[:10] or None,
+                    'overdue_days': overdue_days,
+                },
+                fingerprint_salt=planned[:10] or 'no_plan',
+            ))
+        return out
+
+    def explain(self, payload: dict) -> str:
+        doc = payload.get('doc', {})
+        received = ('приёмки по нему нет' if not payload.get('supplies_count')
+                    else f'принято {format_rub(payload.get("shipped_kopecks"))} '
+                         f'из {format_rub(doc.get("sum_kopecks"))}')
+        paid = (f'Заказ оплачен на {format_rub(doc.get("payed_kopecks"))}, '
+                if doc.get('payed_kopecks') else 'Заказ не оплачен, ')
+        planned = payload.get('planned_delivery')
+        if not planned:
+            return (f'{paid}{received}, а плановая дата приёмки не указана. '
+                    f'Поставь в заказе дату, когда ждём поставку: до неё и ещё '
+                    f'2 дня после агент будет молчать.')
+        day, month, year = planned[8:10], planned[5:7], planned[:4]
+        return (f'{paid}{received}. Плановая дата приёмки {day}.{month}.{year} '
+                f'прошла {payload.get("overdue_days")} дн. назад. Если поставка задерживается, '
+                f'сдвинь дату в заказе. Если товар уже пришёл, оформи приёмку.')

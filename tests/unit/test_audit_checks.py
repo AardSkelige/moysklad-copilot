@@ -34,14 +34,20 @@ def _doc(entity, doc_id, name, moment, updated=None, applicable=True, **extra):
 class FakeClient:
     """Канированные ответы вместо API. data: {entity: [rows]}."""
 
-    def __init__(self, data=None, stock=None, audit_events=None, batches=None):
+    def __init__(self, data=None, stock=None, audit_events=None, batches=None,
+                 materials=None, positions=None):
         self.data = data or {}
         self.stock = stock or []
         self.audit_events = audit_events or []
         self.batches = batches or {}
+        self.materials = materials or {}
+        self.positions = positions or {}
 
     async def list_entities(self, session, entity, **kwargs):
-        return self.data.get(entity, [])
+        rows = self.data.get(entity, [])
+        if kwargs.get('filters') == 'archived=true':
+            return [r for r in rows if r.get('archived')]
+        return rows
 
     async def stock_all(self, session, stock_mode='all'):
         return self.stock
@@ -54,6 +60,12 @@ class FakeClient:
 
     async def stock_batches(self, session, product_id):
         return self.batches.get(product_id, [])
+
+    async def production_materials(self, session, task_id):
+        return self.materials.get(task_id, [])
+
+    async def get_positions(self, session, entity, entity_id):
+        return self.positions.get(entity_id, [])
 
 
 class FakeContext:
@@ -271,21 +283,11 @@ class TestOrderSupplyMismatch:
         return _doc('purchaseorder', 'po1', '00056', '2026-07-01 10:00:00',
                     state={'name': state_name}, **extra)
 
-    async def test_awaiting_status_silences_underdelivery(self):
-        # Живой кейс №00056: статус «Заказано», предоплата есть, приёмок нет — норма
-        from services.audit.checks.purchases import OrderSupplyMismatchCheck
-        order = self._order('Заказано', sum=465700, shippedSum=0, payedSum=465700)
-        ctx = FakeContext(FakeClient({'purchaseorder': [order]}))
-        assert await OrderSupplyMismatchCheck().detect(ctx, None) == []
-
-    async def test_accepted_status_underdelivery_detected(self):
+    async def test_underdelivery_left_to_overdue_check(self):
         from services.audit.checks.purchases import OrderSupplyMismatchCheck
         order = self._order('Принято', sum=465700, shippedSum=100000, payedSum=465700)
         ctx = FakeContext(FakeClient({'purchaseorder': [order]}))
-        found = await OrderSupplyMismatchCheck().detect(ctx, None)
-        assert len(found) == 1
-        assert 'приёмки меньше заказа' in found[0].payload['signals']
-        assert found[0].payload['status'] == 'Принято'
+        assert await OrderSupplyMismatchCheck().detect(ctx, None) == []
 
     async def test_overpayment_signals_even_when_awaiting(self):
         from services.audit.checks.purchases import OrderSupplyMismatchCheck
@@ -293,6 +295,63 @@ class TestOrderSupplyMismatch:
         ctx = FakeContext(FakeClient({'purchaseorder': [order]}))
         found = await OrderSupplyMismatchCheck().detect(ctx, None)
         assert found[0].payload['signals'] == ['оплачено больше суммы заказа']
+
+
+class TestOrderSupplyOverdue:
+    def _order(self, days_ago, planned_in_days=None, state_name='Оплачено', **extra):
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        if planned_in_days is not None:
+            extra['deliveryPlannedMoment'] = (
+                now + timedelta(days=planned_in_days)).strftime('%Y-%m-%d %H:%M:%S.000')
+        moment = (now - timedelta(days=days_ago)).strftime('%Y-%m-%d %H:%M:%S')
+        return _doc('purchaseorder', 'po1', '00114', moment, state={'name': state_name},
+                    sum=489600, shippedSum=0, payedSum=489600, **extra)
+
+    async def _detect(self, order):
+        from services.audit.checks.purchases import OrderSupplyOverdueCheck
+        ctx = FakeContext(FakeClient({'purchaseorder': [order]}))
+        return await OrderSupplyOverdueCheck().detect(ctx, None)
+
+    async def test_planned_date_ahead_silent(self):
+        # Живой кейс №00114: оплачен 19.10, лежит в СДЭКе, приёмку сделают при получении
+        assert await self._detect(self._order(days_ago=8, planned_in_days=1)) == []
+
+    async def test_two_days_slack_after_planned_date(self):
+        # поставщики опаздывают на день-два, это не сигнал
+        assert await self._detect(self._order(days_ago=8, planned_in_days=-1)) == []
+
+    async def test_planned_date_overdue_detected(self):
+        from services.audit.checks.purchases import OrderSupplyOverdueCheck
+        found = await self._detect(self._order(days_ago=8, planned_in_days=-3))
+        assert len(found) == 1
+        assert found[0].payload['overdue_days'] == 3
+        assert 'прошла 3 дн. назад' in OrderSupplyOverdueCheck().explain(found[0].payload)
+
+    async def test_no_planned_date_asks_to_set_it(self):
+        from services.audit.checks.purchases import OrderSupplyOverdueCheck
+        found = await self._detect(self._order(days_ago=4))
+        assert len(found) == 1
+        assert found[0].payload['planned_delivery'] is None
+        text = OrderSupplyOverdueCheck().explain(found[0].payload)
+        assert 'плановая дата приёмки не указана' in text
+        assert '4 896,00 ₽' in text
+
+    async def test_fresh_order_without_date_silent(self):
+        assert await self._detect(self._order(days_ago=2)) == []
+
+    async def test_awaiting_status_silent(self):
+        # Живой кейс №00056: статус «Заказано», предоплата есть, приёмок нет — норма
+        assert await self._detect(self._order(days_ago=30, state_name='Заказано')) == []
+
+    async def test_planned_date_beats_awaiting_status(self):
+        order = self._order(days_ago=30, planned_in_days=-5, state_name='Заказано')
+        assert len(await self._detect(order)) == 1
+
+    async def test_fully_received_silent(self):
+        order = self._order(days_ago=30)
+        order['shippedSum'] = order['sum']
+        assert await self._detect(order) == []
 
 
 class TestDemandZero:
@@ -529,6 +588,43 @@ class TestRootProduct:
         prod['archived'] = True
         data = {'product': [prod], 'productfolder': []}
         assert await RootProductCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+
+class TestProductCodeScheme:
+    def _product(self, pid, name, code, archived=False):
+        return {'id': pid, 'name': name, 'code': code, 'archived': archived,
+                'meta': {'href': f'{MS}/entity/product/{pid}', 'type': 'product'},
+                'productFolder': {'name': 'Упаковка',
+                                  'meta': {'href': f'{MS}/entity/productfolder/f5'}}}
+
+    async def test_suggests_next_free_number_in_series(self):
+        # Живой кейс: в «Упаковке» серия 5-, а три новые карточки получили 3-146..3-148
+        from services.audit.checks.products import ProductCodeSchemeCheck
+        data = {'product': [
+            self._product('p1', 'Короб 8х8х15', '5-005'),
+            self._product('p2', 'Короб 8х8х20', '5-006'),
+            self._product('p3', 'Короб 8х8х25', '5-030'),
+            self._product('p4', 'Скотч старый', '5-035', archived=True),
+            self._product('p5', 'Клейкая лента Осторожно хрупкое', '3-147'),
+            self._product('p6', 'Картонный короб 40х40х30', '3-146'),
+        ]}
+        found = await ProductCodeSchemeCheck().detect(FakeContext(FakeClient(data)), None)
+        suggested = {f.payload['code']: f.payload['suggested_code'] for f in found}
+        assert suggested == {'3-146': '5-036', '3-147': '5-037'}
+
+    async def test_duplicate_with_archived_product_detected(self):
+        from services.audit.checks.products import ProductCodeSchemeCheck
+        data = {'product': [
+            self._product('p1', 'Короб 8х8х15', '5-005'),
+            self._product('p2', 'Короб 8х8х20', '5-006'),
+            self._product('p3', 'Короб 8х8х25', '5-018'),
+            self._product('p4', 'Скотч прозрачный', '5-018', archived=True),
+        ]}
+        found = await ProductCodeSchemeCheck().detect(FakeContext(FakeClient(data)), None)
+        assert len(found) == 1
+        assert found[0].payload['issue'] == 'duplicate_code'
+        assert found[0].entity_id == 'p3'
+        assert 'Скотч прозрачный (архив)' in found[0].payload['products']
 
 
 class TestDeliveryAsPosition:
@@ -895,6 +991,37 @@ class TestCounterpartyBalance:
         assert 'переплата поставщику' in found[0].payload['signals'][0]
         # суммы в payload — в рублях: аналитик путался в конвертации копеек
         assert found[0].payload['paid_out_rub'] == 42140.0
+
+    def _lemun(self):
+        # Живой кейс ЛЕМУНа: в приёмке 00045 доставка 6 287 ₽ сидит и в ценах,
+        # и в накладных, поставщику оплачено без неё
+        agent = self._agent('lem', 'ЛЕМУН')
+        order = _doc('purchaseorder', 'po38', '00038', '2026-05-15 10:00:00',
+                     sum=2986885, shippedSum=2986885, agent=agent,
+                     description='Яна: доставка 6 287 р, вбить в накладные расходы в приемке.')
+        supply = _doc('supply', 's45', '00045', '2026-06-09 10:00:00', sum=2986885,
+                      payedSum=2358185, agent=agent,
+                      purchaseOrder={'meta': {'href': f'{MS}/entity/purchaseorder/po38'}})
+        payment = _doc('paymentout', 'p75', '00075', '2026-06-04 10:00:00',
+                       sum=2358185, agent=agent)
+        return {'supply': [supply], 'paymentout': [payment], 'purchaseorder': [order]}
+
+    async def test_unpaid_supply_named_with_order_comment(self, monkeypatch):
+        import services.audit.checks.money as money
+        monkeypatch.setattr(money, 'SETTLED_SUPPLY_GAPS', {})
+        found = await money.CounterpartyBalanceCheck().detect(
+            FakeContext(FakeClient(self._lemun())), None)
+        unpaid = found[0].payload['unpaid_supplies']
+        assert unpaid[0]['supply'] == 'Приёмка №00045 от 2026-06-09'
+        assert unpaid[0]['unpaid_rub'] == 6287.0
+        assert 'накладные расходы' in unpaid[0]['order_comment']
+
+    async def test_settled_supply_gap_not_counted(self, monkeypatch):
+        import services.audit.checks.money as money
+        monkeypatch.setattr(money, 'SETTLED_SUPPLY_GAPS', {'00045': 'доставка учтена дважды'})
+        found = await money.CounterpartyBalanceCheck().detect(
+            FakeContext(FakeClient(self._lemun())), None)
+        assert found == []
 
     async def test_commission_agent_debt_counts_sold_only(self):
         # Живой кейс Каприоля: отгружено на реализацию 327 763 ₽, продано по отчёту
@@ -1314,6 +1441,62 @@ class TestFifoChecks:
         ctx2 = FakeContext(client)
         fp2 = fingerprint(check.id, (await check.detect(ctx2, None))[0])
         assert fp1 != fp2
+
+
+class TestProductionStuck:
+    # Живой кейс №00253: «жду крышки» с 05.10, но крышки давно на складе,
+    # а основы в баке на 10 флаконов из 50
+    CAP = f'{MS}/entity/product/cap'
+    BASE = f'{MS}/entity/product/base'
+
+    def _task(self):
+        from datetime import datetime, timedelta
+        moment = (datetime.now() - timedelta(days=21)).strftime('%Y-%m-%d %H:%M:%S')
+        return _doc('productiontask', 't253', '00253', moment,
+                    state={'name': 'наклейки'}, description='жду крышки')
+
+    def _order(self, planned_in_days):
+        from datetime import datetime, timedelta
+        planned = (datetime.now() + timedelta(days=planned_in_days)).strftime(
+            '%Y-%m-%d %H:%M:%S.000')
+        return _doc('purchaseorder', 'po114', '00114', '2026-10-19 12:10:00',
+                    sum=489600, shippedSum=0, deliveryPlannedMoment=planned)
+
+    async def _detect(self, base_stock, cap_stock, order=None):
+        from services.audit.checks.production import ProductionStuckCheck
+        materials = {'t253': [
+            {'href': self.BASE, 'code': '2-070', 'name': 'Основа', 'need': 50.0},
+            {'href': self.CAP, 'code': '4-028', 'name': 'Крышка', 'need': 50.0},
+        ]}
+        stock = [{'meta': {'href': self.BASE}, 'stock': base_stock},
+                 {'meta': {'href': self.CAP}, 'stock': cap_stock}]
+        positions = {'po114': [{'assortment': {'meta': {'href': self.CAP}},
+                                'quantity': 600, 'shipped': 0}]}
+        data = {'productiontask': [self._task()],
+                'purchaseorder': [order] if order else []}
+        client = FakeClient(data, stock=stock, materials=materials, positions=positions)
+        return await ProductionStuckCheck().detect(FakeContext(client), None)
+
+    async def test_shortage_and_stale_comment_reported(self):
+        from services.audit.checks.production import ProductionStuckCheck
+        found = await self._detect(base_stock=10, cap_stock=102, order=self._order(1))
+        assert len(found) == 1
+        p = found[0].payload
+        assert [s['material'] for s in p['short_materials']] == ['2-070 Основа']
+        assert p['materials_in_stock'] == ['4-028 Крышка']
+        assert 'нужно 50, на складе 10' in ProductionStuckCheck().explain(p)
+
+    async def test_waiting_for_ordered_material_silent(self):
+        assert await self._detect(base_stock=50, cap_stock=0, order=self._order(1)) == []
+
+    async def test_ordered_material_overdue_reported(self):
+        found = await self._detect(base_stock=50, cap_stock=0, order=self._order(-3))
+        assert found[0].payload['short_materials'][0]['awaited_orders'][0]['order'] == '00114'
+
+    async def test_all_materials_in_stock_reported(self):
+        from services.audit.checks.production import ProductionStuckCheck
+        found = await self._detect(base_stock=50, cap_stock=102)
+        assert 'Все материалы на складе есть' in ProductionStuckCheck().explain(found[0].payload)
 
 
 class TestProductionRetroEdit:

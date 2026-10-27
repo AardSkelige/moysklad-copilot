@@ -60,6 +60,7 @@ class AuditRunner:
 
         new_findings: list[Finding] = []
         seen_fingerprints: set[str] = set()
+        failed_checks: set[str] = set()
         error_text = None
 
         try:
@@ -73,6 +74,7 @@ class AuditRunner:
                     except Exception as e:
                         logger.exception(f'[audit] проверка {check.id} упала')
                         error_text = f'{check.id}: {e}'
+                        failed_checks.add(check.id)
                         continue
                     for raw in raws:
                         f = await self._process_raw(check, raw, seen_fingerprints)
@@ -80,7 +82,7 @@ class AuditRunner:
                             new_findings.append(f)
 
             if run_type == 'full':
-                await self._resolve_vanished(seen_fingerprints)
+                await self._resolve_vanished(seen_fingerprints, failed_checks)
         except Exception as e:
             logger.exception('[audit] прогон упал')
             error_text = str(e)
@@ -128,6 +130,11 @@ class AuditRunner:
             existing = (await db.execute(
                 select(Finding).where(Finding.fingerprint == fp)
             )).scalar_one_or_none()
+            # проблема вернулась после исправления, тревожим заново на той же записи
+            reopen_id = None
+            if existing is not None and existing.status in (
+                    FindingStatus.RESOLVED, FindingStatus.FIXED):
+                reopen_id, existing = existing.id, None
             if existing is not None:
                 existing.last_seen_at = datetime.now()
                 stored = json.loads(existing.payload or '{}')
@@ -205,6 +212,16 @@ class AuditRunner:
 
         now = datetime.now()
         async with session_scope() as db:
+            if reopen_id is not None:
+                finding = await db.get(Finding, reopen_id)
+                finding.severity = severity.value
+                finding.entity_name = raw.entity_name
+                finding.payload = json.dumps(payload, ensure_ascii=False, default=str)
+                finding.status = status
+                finding.last_seen_at = now
+                await db.flush()
+                db.expunge(finding)
+                return finding if status == FindingStatus.NEW else None
             finding = Finding(
                 check_id=check.id,
                 section=check.section.value,
@@ -237,13 +254,14 @@ class AuditRunner:
         return row is not None
 
     @staticmethod
-    async def _resolve_vanished(seen: set[str]):
-        """Полный скан: активные findings, не встреченные в этом прогоне, — проблема ушла."""
+    async def _resolve_vanished(seen: set[str], failed_checks: set[str]):
+        """Полный скан: активные findings, не встреченные в этом прогоне, — проблема ушла.
+        Упавшая проверка ничего не видела, её находки не трогаем."""
         active = (FindingStatus.NEW, FindingStatus.NOTIFIED, FindingStatus.ACKNOWLEDGED)
         async with session_scope() as db:
             rows = (await db.execute(
                 select(Finding).where(Finding.status.in_(active))
             )).scalars().all()
             for f in rows:
-                if f.fingerprint not in seen:
+                if f.fingerprint not in seen and f.check_id not in failed_checks:
                     f.status = FindingStatus.RESOLVED
