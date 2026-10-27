@@ -1474,6 +1474,7 @@ class TestProductionStuck:
                                 'quantity': 600, 'shipped': 0}]}
         data = {'productiontask': [self._task()],
                 'purchaseorder': [order] if order else []}
+        data['processingplan'] = [{'products': {'rows': [{'assortment': {'meta': {'href': self.BASE}}}]}}]
         client = FakeClient(data, stock=stock, materials=materials, positions=positions)
         return await ProductionStuckCheck().detect(FakeContext(client), None)
 
@@ -1483,6 +1484,7 @@ class TestProductionStuck:
         assert len(found) == 1
         p = found[0].payload
         assert [s['material'] for s in p['short_materials']] == ['2-070 Основа']
+        assert p['short_materials'][0]['made_in_house'] is True
         assert p['materials_in_stock'] == ['4-028 Крышка']
         assert 'нужно 50, на складе 10' in ProductionStuckCheck().explain(p)
 

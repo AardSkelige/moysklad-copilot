@@ -144,6 +144,14 @@ async def _awaited_supplies(ctx: AuditContext) -> dict[str, list[dict]]:
     return out
 
 
+async def _made_in_house(ctx: AuditContext) -> set[str]:
+    """Товары, которые выпускаем сами по техкартам."""
+    plans = await ctx.cached_list('processingplans_products', 'processingplan',
+                                  expand='products', max_rows=1000)
+    return {r['assortment']['meta']['href'].split('?')[0]
+            for p in plans for r in (p.get('products') or {}).get('rows', [])}
+
+
 def _arrives_in_time(order: dict, now: datetime) -> bool:
     return bool(order['planned']) and now <= datetime.fromisoformat(order['planned']) + PLAN_SLACK
 
@@ -191,8 +199,11 @@ class ProductionStuckCheck(CheckSpec):
             if short:
                 if awaited is None:
                     awaited = await _awaited_supplies(ctx)
+                    made = await _made_in_house(ctx)
                 for s in short:
-                    s['awaited_orders'] = awaited.get(s.pop('href'), [])
+                    href = s.pop('href')
+                    s['awaited_orders'] = awaited.get(href, [])
+                    s['made_in_house'] = href in made
                 if all(any(_arrives_in_time(o, ctx.now) for o in s['awaited_orders'])
                        for s in short):
                     continue
@@ -209,6 +220,9 @@ class ProductionStuckCheck(CheckSpec):
                     'description': (d.get('description') or '')[:300],
                     'short_materials': short,
                     'materials_in_stock': in_stock,
+                    'note': ('made_in_house: материал выпускаем сами по техкарте, поставки '
+                             'по нему не бывает, его варят отдельным заданием. '
+                             'Остатки материалов уже посчитаны, проверять их не нужно.'),
                 },
                 fingerprint_salt='',
             ))
