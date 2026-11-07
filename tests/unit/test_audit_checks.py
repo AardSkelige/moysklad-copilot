@@ -35,8 +35,9 @@ class FakeClient:
     """Канированные ответы вместо API. data: {entity: [rows]}."""
 
     def __init__(self, data=None, stock=None, audit_events=None, batches=None,
-                 materials=None, positions=None):
+                 materials=None, positions=None, completed_products=None):
         self.data = data or {}
+        self.completed_products = completed_products or set()
         self.stock = stock or []
         self.audit_events = audit_events or []
         self.batches = batches or {}
@@ -66,6 +67,9 @@ class FakeClient:
 
     async def get_positions(self, session, entity, entity_id):
         return self.positions.get(entity_id, [])
+
+    async def task_completed_products(self, session, task_href):
+        return self.completed_products
 
 
 class FakeContext:
@@ -480,6 +484,22 @@ class TestDemandOverheadPayment:
         found = await DemandOverheadPaymentCheck().detect(ctx, None)
         assert len(found) == 1
         assert found[0].payload['overhead_kopecks'] == 51941
+
+    async def test_order_comment_and_past_delivery_in_payload(self):
+        from services.audit.checks.sales import DemandOverheadPaymentCheck
+        demand = _doc('demand', 'd1', '00031', '2026-05-12 10:00:00', sum=182500,
+                      overhead={'sum': 26089},
+                      customerOrder={'name': '00033', 'description': 'Оля: поедет курьером.'})
+        past = _doc('cashout', 'c1', '00057', '2026-05-01 10:00:00', sum=26718,
+                    description='Ира: оплатила доставку своими.',
+                    agent={'name': 'ООО "КУРЬЕР ПРИМЕР"'})
+        past['meta']['type'] = 'cashout'
+        ctx = FakeContext(FakeClient({'demand': [demand], 'paymentout': [], 'cashout': [past]}))
+        found = await DemandOverheadPaymentCheck().detect(ctx, None)
+        assert found[0].payload['order_comment'] == 'Оля: поедет курьером.'
+        assert found[0].payload['past_delivery_payments'] == [{
+            'type': 'РКО', 'agent': 'ООО "КУРЬЕР ПРИМЕР"', 'sum_rub': 267.18,
+            'comment': 'Ира: оплатила доставку своими.'}]
 
     async def test_matching_payment_silences(self):
         from services.audit.checks.sales import DemandOverheadPaymentCheck
@@ -1536,6 +1556,36 @@ class TestProductionRetroEdit:
         task['created'] = '2026-07-10 12:00:00'
         ctx = FakeContext(FakeClient({'productiontask': [task]}))
         assert await ProductionRetroEditCheck().detect(ctx, None) == []
+
+    def _row_removed(self, product):
+        return [{'moment': '2026-07-10 12:00:00.000', 'eventType': 'update', 'diff': {
+            'productionEnd': {'oldValue': '2026-06-24T18:00'},
+            'productionRows': [{'oldValue': {'name': '00087-3', 'planQuantity': 18.0}}],
+            'materials': [{'oldValue': {'name': '00087-3', 'assortment': {'name': 'Флакон'},
+                                        'planQuantity': 18.0}}],
+            'products': [{'oldValue': {'name': '00087-3', 'assortment': {'name': product},
+                                       'planQuantity': 18.0}}],
+        }}]
+
+    async def test_removed_unexecuted_row_is_not_an_edit(self):
+        from services.audit.checks.production import ProductionRetroEditCheck
+        task = self._task('t5', '00087', '2026-06-22 10:00:00',
+                          updated='2026-07-10 12:00:00',
+                          production_end='2026-06-24 18:00:00')
+        ctx = FakeContext(FakeClient({'productiontask': [task]},
+                                     audit_events=self._row_removed('Кондиционер А 500 мл'),
+                                     completed_products={'Кондиционер Б 5000 мл'}))
+        assert await ProductionRetroEditCheck().detect(ctx, None) == []
+
+    async def test_removed_executed_row_detected(self):
+        from services.audit.checks.production import ProductionRetroEditCheck
+        task = self._task('t6', '00087', '2026-06-22 10:00:00',
+                          updated='2026-07-10 12:00:00',
+                          production_end='2026-06-24 18:00:00')
+        ctx = FakeContext(FakeClient({'productiontask': [task]},
+                                     audit_events=self._row_removed('Кондиционер А 500 мл'),
+                                     completed_products={'Кондиционер А 500 мл'}))
+        assert len(await ProductionRetroEditCheck().detect(ctx, None)) == 1
 
     async def test_same_day_completion_edit_ok(self):
         from services.audit.checks.production import ProductionRetroEditCheck

@@ -33,6 +33,22 @@ def _payment_text(payment: dict) -> str:
     return f'{payment.get("paymentPurpose") or ""} {payment.get("description") or ""}'
 
 
+def _past_delivery_payments(payments: list[dict], limit: int = 5) -> list[dict]:
+    out = []
+    for p in payments:
+        if 'достав' not in _payment_text(p).lower():
+            continue
+        out.append({
+            'type': 'РКО' if p.get('meta', {}).get('type') == 'cashout' else 'исходящий платёж',
+            'agent': (p.get('agent') or {}).get('name'),
+            'sum_rub': round(p.get('sum', 0) / 100, 2),
+            'comment': (p.get('description') or '')[:200],
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
 def mentions_document(text: str, doc_number: str) -> bool:
     """Платёж ссылается на документ его номером — так связь оформлена по стандарту.
 
@@ -212,7 +228,7 @@ class DemandOverheadPaymentCheck(CheckSpec):
         demands = await ctx.client.list_entities(
             ctx.session, 'demand',
             filters=f'moment>={ctx.scan_since_moment};applicable=true',
-            expand='agent',
+            expand='agent,customerOrder',
             order='moment,desc',
         )
         payments = []
@@ -225,6 +241,7 @@ class DemandOverheadPaymentCheck(CheckSpec):
                     continue
                 payments.append(p)
 
+        past_delivery = _past_delivery_payments(payments)
         out = []
         grace = ctx.now - timedelta(hours=config.AUDIT_DEMAND_GRACE_HOURS)
         for d in demands:
@@ -259,6 +276,7 @@ class DemandOverheadPaymentCheck(CheckSpec):
                     break
             if matched is not None:
                 continue
+            order = d.get('customerOrder') or {}
             out.append(RawFinding(
                 entity_type='demand',
                 entity_id=d['id'],
@@ -272,6 +290,10 @@ class DemandOverheadPaymentCheck(CheckSpec):
                     'overhead_kopecks': overhead,
                     'delivery_method': delivery,
                     'description': (d.get('description') or '')[:300],
+                    'customer_order': (f'Заказ покупателя №{order["name"]}'
+                                       if order.get('name') else None),
+                    'order_comment': (order.get('description') or '')[:300],
+                    'past_delivery_payments': past_delivery,
                     'note': (f'В отгрузке №{d["name"]} указаны накладные расходы '
                              f'{overhead / 100:.2f} ₽'
                              + (f' (способ доставки: {delivery})' if delivery else '')
@@ -289,7 +311,11 @@ class DemandOverheadPaymentCheck(CheckSpec):
                                  '(create_payment, статья расходов «Логистика»), связь '
                                  'с отгрузкой только через комментарий. НИКОГДА не '
                                  'предлагай привязывать платёж за доставку к документам. '
-                                 'Если сумма накладных ошибочна — убрать её из отгрузки.'),
+                                 'Если сумма накладных ошибочна — убрать её из отгрузки. '
+                                 'Перевозчика ищи в order_comment, а контрагента, тип '
+                                 'платежа и формат комментария бери по образцу '
+                                 'past_delivery_payments; переспрашивай, только если '
+                                 'там ответа нет.'),
                 },
                 fingerprint_salt=str(overhead),
                 ui_link=(d.get('meta') or {}).get('uuidHref', ''),

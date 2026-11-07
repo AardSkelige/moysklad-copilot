@@ -135,9 +135,10 @@ class TestReviewDocuments:
         assert out[0]['new_comment'].startswith('Аня:')
 
 
-def _demand(doc_id='dm1', comment='', order_comment='', overhead=0.0, delivery=None):
+def _demand(doc_id='dm1', comment='', order_comment='', overhead=0.0, delivery=None,
+            agent='Иванова Мария'):
     return {'entity': 'demand', 'id': doc_id, 'kind': 'demand',
-            'label': 'Отгрузка №00030 от 2026-05-21', 'agent': 'Иванова Мария',
+            'label': 'Отгрузка №00030 от 2026-05-21', 'agent': agent,
             'sum_rub': 0.0, 'comment': comment, 'overhead_rub': overhead,
             'delivery_method': delivery,
             'order_id': 'o1', 'order_name': '00032', 'order_comment': order_comment}
@@ -280,6 +281,24 @@ class TestReviewDemands:
             'reason': 'пояснение нуля'}], ensure_ascii=False), 'tool_calls': []}])
         docs = [_demand(delivery='СДЭК (до пункта выдачи)')]
         assert await review_documents(docs, llm=llm) == []
+
+    async def test_marketplace_template_goes_to_batch_not_card(self):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': 'Накладные расходы 0 — доставку оплачивает маркетплейс.',
+            'new_order_comment': None,
+            'reason': 'пояснение нуля'}], ensure_ascii=False), 'tool_calls': []}])
+        assert await review_documents([_demand(agent='ООО Ozon')], llm=llm) == []
+
+    async def test_marketplace_order_comment_still_shown(self):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': 'Накладные расходы 0 — доставку оплачивает маркетплейс.',
+            'new_order_comment': 'Ира: заказ Ozon 123.',
+            'reason': 'номер заказа'}], ensure_ascii=False), 'tool_calls': []}])
+        out = await review_documents([_demand(agent='ООО Ozon', order_comment='ира заказ озон 123')],
+                                     llm=llm)
+        assert len(out) == 1
+        assert out[0]['new_comment'] is None
+        assert out[0]['new_order_comment'] == 'Ира: заказ Ozon 123.'
 
     async def test_sdek_existing_comment_still_editable(self):
         # правка стиля существующего текста для СДЭК остаётся разрешённой

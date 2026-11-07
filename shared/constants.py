@@ -81,6 +81,7 @@ class CallbackPrefix:
     AUDIT_TALK = 'aud_talk:'
     AUDIT_SECTION = 'aud_sec:'   # aud_sec:<индекс категории>:<offset>
     AUDIT_COMMENTS_GO = 'aud_cmt_go:'   # aud_cmt_go:<doc|fin>:<дней|0=вся история>
+    AUDIT_COMMENT_MP_DAYS = 'aud_cmt_mpd:'   # aud_cmt_mpd:<дней|0=вся история>
 
     SELECT_CATEGORY = 'cat_sel:'
     LIST_PAGE = 'list_page:'

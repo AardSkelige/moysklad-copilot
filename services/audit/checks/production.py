@@ -32,6 +32,27 @@ def is_cosmetic(events: list[dict]) -> bool:
         meaningful_fields(ev.get('diff') or {}) <= _HARMLESS_FIELDS for ev in events)
 
 
+_ROW_FIELDS = {'productionRows', 'materials', 'products', 'enableHourAccounting'}
+_DATE_FIELDS = {'productionStart', 'productionEnd'}
+
+
+def removed_products(events: list[dict]) -> set[str] | None:
+    removed = set()
+    for ev in events:
+        diff = ev.get('diff') or {}
+        for field in meaningful_fields(diff):
+            if field in _HARMLESS_FIELDS or field in _DATE_FIELDS:
+                continue
+            change = diff[field]
+            if field not in _ROW_FIELDS or not isinstance(change, list):
+                return None
+            if any(c.get('newValue') or not c.get('oldValue') for c in change):
+                return None
+            if field == 'products':
+                removed |= {(c['oldValue'].get('assortment') or {}).get('name') for c in change}
+    return removed or None
+
+
 _MAX_AUDIT_DIFFS = 300   # см. комментарий в cross.py: без истории отсев косметики не работает
 
 
@@ -88,6 +109,10 @@ class ProductionRetroEditCheck(CheckSpec):
                     diffs_budget -= 1
                     if is_cosmetic(raw_events):
                         continue   # правили только комментарий/номер — учёт не затронут
+                    removed = removed_products(raw_events)
+                    if removed and not removed & await ctx.client.task_completed_products(
+                            ctx.session, d['meta']['href']):
+                        continue
                     events = _slim_audit_events(raw_events)
                     # отпечаток — по последней значимой правке, иначе причёсанный
                     # комментарий присылает разобранную находку заново

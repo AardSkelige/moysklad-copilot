@@ -121,6 +121,20 @@ class MoySkladAuditClient:
                 })
         return out
 
+    async def task_completed_products(
+        self, session: aiohttp.ClientSession, task_href: str
+    ) -> set[str]:
+        completions = await self.list_entities(
+            session, 'productionstagecompletion', filters=f'productionTask={task_href}')
+        out: set[str] = set()
+        for c in completions:
+            if not c.get('products'):
+                continue
+            data = await self.http.get(
+                session, c['products']['meta']['href'].split('?')[0], 'expand=assortment')
+            out |= {r['assortment']['name'] for r in (data or {}).get('rows', [])}
+        return out
+
     # --- запись (только из ErrorFixService после подтверждения) ---
 
     async def update_entity(

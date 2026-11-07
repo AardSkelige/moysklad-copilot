@@ -218,6 +218,8 @@ async def on_comments_start(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(
             '⚠️ МойСклад не отдал часть документов: ' + ', '.join(failed) +
             '.\nЭти типы НЕ проверены — стоит повторить позже.')
+    if not is_finance:
+        await _offer_marketplace_batch(callback.message, days)
     if not failed and not suggestions:
         await callback.message.answer(
             f'Проверил {len(docs)} документов — все комментарии в порядке 🎉',
@@ -235,6 +237,22 @@ async def on_comments_start(callback: CallbackQuery, state: FSMContext):
         f'Проверил {len(docs)} документов, предлагаю поправить {len(suggestions)}. '
         f'Иду по типам документов, от старых к новым:')
     await _show_card(callback.message, state)
+
+
+async def _offer_marketplace_batch(message: Message, days: int):
+    try:
+        items = await collect_marketplace_zero_fixes(days)
+    except Exception:
+        logger.warning('[comments] не посчитал отгрузки маркетплейсов', exc_info=True)
+        return
+    if not items:
+        return
+    await message.answer(
+        f'📦 Ещё {len(items)} отгрузок маркетплейсов с пустым комментарием: '
+        f'карточками не показываю, проставлю стандартную фразу одной кнопкой.',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=f'📦 Проставить всем {len(items)}',
+            callback_data=f'{CallbackPrefix.AUDIT_COMMENT_MP_DAYS}{days}')]]))
 
 
 @router.message(AuditState.reviewing_comments, F.text, ~F.text.startswith('/'))
@@ -388,6 +406,19 @@ async def on_dots(callback: CallbackQuery):
 async def on_marketplace(callback: CallbackQuery):
     """Проставить стандартный комментарий отгрузкам маркетплейсов с нулевыми накладными."""
     await _run_batch_fix(callback, collect_marketplace_zero_fixes,
+                         title='📦 Собираю отгрузки маркетплейсов',
+                         doing='Проставляю комментарий',
+                         nothing='Все отгрузки маркетплейсов уже с комментарием 🎉',
+                         done_text='Проставлено')
+
+
+@router.callback_query(F.data.startswith(CallbackPrefix.AUDIT_COMMENT_MP_DAYS))
+async def on_marketplace_for_period(callback: CallbackQuery):
+    try:
+        days = int(callback.data[len(CallbackPrefix.AUDIT_COMMENT_MP_DAYS):])
+    except ValueError:
+        days = config.AUDIT_COMMENT_REVIEW_DAYS
+    await _run_batch_fix(callback, lambda _: collect_marketplace_zero_fixes(days),
                          title='📦 Собираю отгрузки маркетплейсов',
                          doing='Проставляю комментарий',
                          nothing='Все отгрузки маркетплейсов уже с комментарием 🎉',
