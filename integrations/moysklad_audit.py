@@ -5,6 +5,7 @@ ErrorFixService после подтверждения владельцем кн�
 """
 
 from typing import AsyncIterator
+from urllib.parse import quote
 
 import aiohttp
 
@@ -66,6 +67,16 @@ class MoySkladAuditClient:
         data = await self.http.get(
             session, '/report/stock/bystore',
             f'limit=1000&filter={encode_filter("stockMode=negativeOnly")}',
+        )
+        return (data or {}).get('rows', [])
+
+    async def product_operations(
+        self, session: aiohttp.ClientSession, product_href: str, since: str
+    ) -> list[dict]:
+        data = await self.http.get(
+            session, '/report/turnover/byoperations',
+            f'limit=1000&momentFrom={quote(since)}'
+            f'&filter={encode_filter(f"product={product_href}")}',
         )
         return (data or {}).get('rows', [])
 

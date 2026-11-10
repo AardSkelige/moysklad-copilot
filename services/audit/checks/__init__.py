@@ -20,7 +20,9 @@ from services.audit.checks.purchases import (
 from services.audit.checks.sales import (
     DemandNoOverheadCheck, DemandOverheadPaymentCheck, DemandZeroCheck,
 )
-from services.audit.checks.warehouse import EnterPriceVsFifoCheck, NegativeStockCheck
+from services.audit.checks.negative_stock import NegativeStockCheck
+from services.audit.checks.sale_price import DemandPriceVsRetailCheck
+from services.audit.checks.warehouse import EnterPriceVsFifoCheck
 from services.audit.specs import CheckSpec
 
 
@@ -56,6 +58,7 @@ def build_registry() -> list[CheckSpec]:
         DemandZeroCheck(),
         DemandNoOverheadCheck(),
         DemandOverheadPaymentCheck(),
+        DemandPriceVsRetailCheck(),
         RetroEditCheck(),
         ProductionRetroEditCheck(),
         ProductionStuckCheck(),

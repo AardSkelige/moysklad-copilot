@@ -2,9 +2,17 @@
 
 from datetime import datetime
 
-from services.audit.checks.products import _product_source_docs, previous_receipt_price
+from services.audit.checks.products import (
+    _product_source_docs,
+    previous_receipt_price,
+    says_free,
+)
 from services.audit.context import AuditContext, format_moment
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
+from services.audit.team_context import NON_COST_FOLDERS
+
+_OUTSIDE_COST_NOTE = ('Упаковка и хозтовары не входят в техкарты: цена влияет только на '
+                      'стоимость их списания, себестоимость готовой продукции не меняется.')
 
 # Хозтовары и упаковку покупают в разных магазинах, и цена гуляет: стрейч-плёнка
 # бралась по 498 и 733 ₽. Ниже 30% — обычный разброс закупки, а не ошибка учёта.
@@ -40,6 +48,7 @@ class EnterPriceVsFifoCheck(CheckSpec):
         out = []
         for d in docs:
             suspicious = []
+            free = says_free(d.get('description'))
             for p in d.get('positions', {}).get('rows', []):
                 a = p.get('assortment', {})
                 href = a.get('meta', {}).get('href', '').split('?')[0]
@@ -47,6 +56,8 @@ class EnterPriceVsFifoCheck(CheckSpec):
                 price = p.get('price', 0)
                 previous = previous_receipt_price(sources.get(href, []), (d.get('moment') or '')[:19])
                 prev_price = (previous or {}).get('price_kopecks') or 0
+                if price == 0 and free:
+                    continue
                 if fifo_price and price == 0:
                     kind = 'цена 0 при ненулевой себестоимости'
                 elif (prev_price
@@ -62,6 +73,7 @@ class EnterPriceVsFifoCheck(CheckSpec):
                     'previous_receipt': previous,
                     'current_fifo_kopecks': fifo_price,
                     'signal': kind,
+                    'in_product_cost': not (a.get('pathName') or '').startswith(NON_COST_FOLDERS),
                 })
             if suspicious:
                 out.append(RawFinding(
@@ -74,6 +86,8 @@ class EnterPriceVsFifoCheck(CheckSpec):
                         'description': (d.get('description') or '')[:300],
                         'moment': (d.get('moment') or '')[:16],
                         'positions': suspicious,
+                        'note': (None if any(s['in_product_cost'] for s in suspicious)
+                                 else _OUTSIDE_COST_NOTE),
                     },
                     fingerprint_salt='|'.join(sorted(s['product'] for s in suspicious)),
                 ))
@@ -82,39 +96,3 @@ class EnterPriceVsFifoCheck(CheckSpec):
     def explain(self, payload: dict) -> str:
         return ('Цены позиций оприходования расходятся с текущей себестоимостью — '
                 'FIFO готовой продукции исказится.')
-
-
-class NegativeStockCheck(CheckSpec):
-    """Отрицательный остаток на конкретном складе — учёт разъехался с реальностью."""
-
-    id = 'negative_stock'
-    section = Section.WAREHOUSE
-    title = 'Отрицательный остаток на складе'
-    default_severity = Severity.CRITICAL
-    llm_triage = False   # математически однозначно, объяснение не требует суждения
-
-    async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
-        rows = await ctx.client.stock_by_store_negative(ctx.session)
-        out = []
-        for r in rows:
-            product_href = r.get('meta', {}).get('href', '').split('?')[0]
-            for s in r.get('stockByStore', []):
-                if s.get('stock', 0) >= 0:
-                    continue
-                store = s.get('name', '?')
-                out.append(RawFinding(
-                    entity_type='product',
-                    entity_id=product_href.split('/')[-1],
-                    entity_href=product_href,
-                    entity_name=f'{r.get("name", "?")} — склад «{store}»',
-                    severity=self.default_severity,
-                    payload={'product': r.get('name'), 'store': store,
-                             'stock': s.get('stock')},
-                    fingerprint_salt=store,
-                ))
-        return out
-
-    def explain(self, payload: dict) -> str:
-        return (f'Остаток {payload.get("stock")} на складе «{payload.get("store")}». '
-                f'Товар ушёл в минус: продано/списано/израсходовано больше, чем числится. '
-                f'Проверь приёмки, перемещения и производственные задания по этому товару.')

@@ -10,6 +10,7 @@ from datetime import datetime
 
 from services.audit.context import AuditContext, is_free_supplier
 from services.audit.specs import CheckSpec, RawFinding, Section, Severity
+from services.audit.team_context import FREE_SOURCE_MARKERS
 
 _DEVIATION_CRITICAL = 0.50    # >50% — похоже на ошибку единиц измерения (кг вместо г и т.п.)
 _DEVIATION_IMPORTANT = 0.15   # 15–50% — рост цены/накладные, стоит взглянуть
@@ -22,6 +23,11 @@ _MAX_BATCH_REPORTS = 60       # запрос партий только по ка
 # «нулевой суммы», «по нулевым ценам» — падежи перечислять бессмысленно
 _FREE_MARKERS = ('бесплатн', 'на пробу', 'подарок', 'подарен', 'нулев',
                  'даром', 'отдали', 'отдал')
+
+
+def says_free(comment: str | None) -> bool:
+    text = (comment or '').lower()
+    return any(m in text for m in (*_FREE_MARKERS, *FREE_SOURCE_MARKERS))
 
 
 def _previously_priced(sources: list[dict]) -> dict | None:
@@ -48,7 +54,7 @@ def _explained_as_free(payload_docs: list[dict], last_supply: dict | None) -> bo
     comments = [c for c in comments if c.strip()]
     if not comments:
         return False
-    return all(any(m in c.lower() for m in _FREE_MARKERS) for c in comments)
+    return all(says_free(c) for c in comments)
 
 
 def _uom(row: dict) -> str:
