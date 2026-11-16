@@ -1,7 +1,7 @@
 from services.audit.checks.cross import DeliveryAsPositionCheck, RetroEditCheck, StaleDocsCheck
+from services.audit.checks.balance import CounterpartyBalanceCheck
 from services.audit.checks.money import (
-    DuplicateCounterpartyCheck,
-    CounterpartyBalanceCheck, PaymentDuplicateCheck, PaymentNoClosingDocsCheck,
+    DuplicateCounterpartyCheck, PaymentDuplicateCheck, PaymentNoClosingDocsCheck,
 )
 from services.audit.checks.production import ProductionRetroEditCheck, ProductionStuckCheck
 from services.audit.checks.products import (

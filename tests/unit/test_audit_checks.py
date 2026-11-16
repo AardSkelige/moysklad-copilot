@@ -1047,7 +1047,7 @@ class TestCounterpartyBalance:
         return {'name': name, 'meta': {'href': f'{MS}/entity/counterparty/{href}'}}
 
     async def test_overpaid_supplier_detected(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         # приёмок на 21 070, оплачено дважды — переплата 21 070 (живой кейс)
         data = {
             'supply': [_doc('supply', 's1', '00049', '2026-06-21 10:00:00', sum=2107000,
@@ -1081,9 +1081,9 @@ class TestCounterpartyBalance:
         return {'supply': [supply], 'paymentout': [payment], 'purchaseorder': [order]}
 
     async def test_unpaid_supply_named_with_order_comment(self, monkeypatch):
-        import services.audit.checks.money as money
-        monkeypatch.setattr(money, 'SETTLED_SUPPLY_GAPS', {})
-        found = await money.CounterpartyBalanceCheck().detect(
+        import services.audit.checks.balance as balance
+        monkeypatch.setattr(balance, 'SETTLED_SUPPLY_GAPS', {})
+        found = await balance.CounterpartyBalanceCheck().detect(
             FakeContext(FakeClient(self._lemun())), None)
         unpaid = found[0].payload['unpaid_supplies']
         assert unpaid[0]['supply'] == 'Приёмка №00045 от 2026-06-09'
@@ -1091,16 +1091,16 @@ class TestCounterpartyBalance:
         assert 'накладные расходы' in unpaid[0]['order_comment']
 
     async def test_settled_supply_gap_not_counted(self, monkeypatch):
-        import services.audit.checks.money as money
-        monkeypatch.setattr(money, 'SETTLED_SUPPLY_GAPS', {'00045': 'доставка учтена дважды'})
-        found = await money.CounterpartyBalanceCheck().detect(
+        import services.audit.checks.balance as balance
+        monkeypatch.setattr(balance, 'SETTLED_SUPPLY_GAPS', {'00045': 'доставка учтена дважды'})
+        found = await balance.CounterpartyBalanceCheck().detect(
             FakeContext(FakeClient(self._lemun())), None)
         assert found == []
 
     async def test_commission_agent_debt_counts_sold_only(self):
         # Живой кейс Каприоля: отгружено на реализацию 327 763 ₽, продано по отчёту
         # комиссионера 78 680 ₽ — долгом является только проданное
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = self._agent('cap', 'КСЦ Каприоль')
         data = {
             'demand': [_doc('demand', 'd1', '00100', '2026-07-01 10:00:00',
@@ -1124,7 +1124,7 @@ class TestCounterpartyBalance:
     async def test_commission_reward_is_not_debt(self):
         # Живой кейс Каприоля 29.09: сравнение оплат с выручкой отчётов (sum)
         # давало фантомный долг — вознаграждение 30% нам не причитается
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = self._agent('cap3', 'КРМОО Каприоль')
         data = {
             'demand': [_doc('demand', 'd1', '00148', '2026-08-07 10:00:00',
@@ -1152,7 +1152,7 @@ class TestCounterpartyBalance:
 
     async def test_commission_agent_settled_is_silent(self):
         # продано по отчёту и оплачено — расхождения нет, хотя отгружено больше
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = self._agent('cap2', 'ИП Комиссионер')
         data = {
             'demand': [_doc('demand', 'd1', '00101', '2026-07-01 10:00:00',
@@ -1183,12 +1183,12 @@ class TestCounterpartyBalance:
 
     async def test_commission_report_within_payment_term_is_silent(self):
         # Живой кейс Вест Поинта: отчёт 02.11, по договору месяц на оплату
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         data = self._westpoint(report_age_days=14)
         assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
 
     async def test_commission_report_past_payment_term_is_debt(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         data = self._westpoint(report_age_days=31)
         found = await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None)
         assert len(found) == 1
@@ -1196,7 +1196,7 @@ class TestCounterpartyBalance:
 
     async def test_marketplace_debt_is_not_a_problem(self):
         # Озон платит реестром за период — долг по отгрузкам выравнивается выплатой
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         ozon = self._agent('oz', 'ООО "Ozon Маркетплейс"')
         data = {'demand': [_doc('demand', 'd1', '00204', '2026-08-16 10:00:00',
                                 sum=11728000, agent=ozon)]}
@@ -1205,7 +1205,7 @@ class TestCounterpartyBalance:
 
     async def test_marketplace_overpayment_still_flagged(self):
         # получено больше, чем отгружено — аномалия даже для маркетплейса
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         ozon = self._agent('oz', 'ООО "Ozon Маркетплейс"')
         data = {
             'demand': [_doc('demand', 'd1', '00204', '2026-08-16 10:00:00',
@@ -1219,7 +1219,7 @@ class TestCounterpartyBalance:
         assert 'получено больше' in found[0].payload['signals'][0]
 
     async def test_balanced_counterparty_silent(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         data = {
             'supply': [_doc('supply', 's1', '00050', '2026-06-21 10:00:00', sum=100000,
                             agent=self._agent())],
@@ -1232,7 +1232,7 @@ class TestCounterpartyBalance:
     async def test_no_closing_docs_payment_excluded_from_balance(self):
         # Стандарт: платёж за доставку = галка «Без закрывающих документов».
         # МойСклад исключает его из взаиморасчётов — мы зеркалим (живой кейс)
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         data = {
             'supply': [_doc('supply', 's1', '00058', '2026-07-04 10:00:00', sum=1380000,
                             agent=self._agent(), overhead={'sum': 185000})],
@@ -1248,7 +1248,7 @@ class TestCounterpartyBalance:
 
     async def test_prepaid_open_order_is_not_overpayment(self):
         # Кейс Тара.ру: заказ «Заказано» оплачен, тара едет — аванс, не переплата
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         data = {
             'supply': [_doc('supply', 's1', '00040', '2026-05-20 10:00:00', sum=774990,
                             agent=self._agent('tara', 'ТАРА.РУ'))],
@@ -1264,7 +1264,7 @@ class TestCounterpartyBalance:
         assert await CounterpartyBalanceCheck().detect(ctx, None) == []
 
     async def test_overpayment_without_open_order_still_flagged(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         data = {
             'supply': [_doc('supply', 's1', '00040', '2026-05-20 10:00:00', sum=774990,
                             agent=self._agent('tara', 'ТАРА.РУ'))],
@@ -1280,7 +1280,7 @@ class TestCounterpartyBalance:
     async def test_unpaid_customer_order_facts_in_payload(self):
         # Живой кейс Александровой: отгрузка не оплачена, но заказ «Ждем оплату»
         # с договорённостью в комментарии — факты уходят LLM, судит он
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = self._agent('olga', 'Александрова Ольга')
         data = {
             'demand': [_doc('demand', 'd1', '00081', '2026-07-07 10:00:00',
@@ -1301,7 +1301,7 @@ class TestCounterpartyBalance:
 
     async def test_pure_payment_counterparty_skipped(self):
         # Банк/подписки: только платежи, товарных документов нет — не взаиморасчёт
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         data = {
             'paymentout': [_doc('paymentout', 'p1', '00088', '2026-06-19 10:00:00',
                                 sum=169000, agent=self._agent('bank', 'ООО БАНК ТОЧКА'))],
@@ -1310,7 +1310,7 @@ class TestCounterpartyBalance:
         assert await CounterpartyBalanceCheck().detect(ctx, None) == []
 
     async def test_unpaid_demand_detected(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         data = {
             'demand': [_doc('demand', 'd1', '00070', '2026-06-25 10:00:00', sum=500000,
                             agent=self._agent('b1', 'ООО Маркетплейс'))],
@@ -1645,7 +1645,7 @@ def _agent_ref(href, name):
 
 class TestBalanceMatchesMoySklad:
     async def test_adjustment_closes_old_overpayment(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = _agent_ref('ru', 'РУССО УПАК')
         data = {
             'supply': [_doc('supply', 's81', '00081', '2026-08-04 10:00:00', sum=1117000, agent=agent)],
@@ -1656,7 +1656,7 @@ class TestBalanceMatchesMoySklad:
         assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
 
     async def test_without_adjustment_overpayment_still_found(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = _agent_ref('ru', 'РУССО УПАК')
         data = {
             'supply': [_doc('supply', 's81', '00081', '2026-08-04 10:00:00', sum=1117000, agent=agent)],
@@ -1665,7 +1665,7 @@ class TestBalanceMatchesMoySklad:
         assert len(await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None)) == 1
 
     async def test_returned_double_payment_nets_to_zero(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = _agent_ref('dar', 'ИП Дарьина')
         data = {
             'demand': [_doc('demand', 'd934', '00934', '2026-10-20 10:00:00', sum=2665000, agent=agent)],
@@ -1678,7 +1678,7 @@ class TestBalanceMatchesMoySklad:
         assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
 
     async def test_sales_return_cancels_shipment(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = _agent_ref('dr', 'Дружинина')
         data = {
             'demand': [_doc('demand', 'd113', '00113', '2026-07-27 10:00:00', sum=458400, agent=agent)],
@@ -1727,7 +1727,7 @@ class TestReturnedOverpayment:
 
 class TestReturnedGoodsWithoutRefund:
     async def test_customer_who_returned_goods_but_got_no_money_is_found(self):
-        from services.audit.checks.money import CounterpartyBalanceCheck
+        from services.audit.checks.balance import CounterpartyBalanceCheck
         agent = _agent_ref('cu', 'Покупатель')
         data = {
             'demand': [_doc('demand', 'd1', '00200', '2026-09-01 10:00:00', sum=458400, agent=agent)],
