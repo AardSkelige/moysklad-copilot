@@ -9,6 +9,9 @@ from services.audit.team_context import SETTLED_SUPPLY_GAPS
 
 _DUPLICATE_WINDOW_DAYS = 14
 
+# по договору комиссионер оплачивает отчёт в течение месяца (Вест Поинт, 16.11.2026)
+_COMMISSION_PAYMENT_DAYS = 30
+
 # статусы заказа, при которых оплата не аванс, а деньги к возврату
 _CANCELLED_ORDER_MARKERS = ('отмен', 'возврат')
 
@@ -299,6 +302,7 @@ class CounterpartyBalanceCheck(CheckSpec):
         sold_by_commission: dict[str, int] = {}
         owed_by_commission: dict[str, int] = {}
         unpaid_reports: dict[str, list] = {}
+        not_yet_due: dict[str, int] = {}
         for r in await ctx.cached_list('commissionreportin_all', 'commissionreportin',
                                        expand='agent', order='moment,desc', max_rows=1000):
             if r.get('applicable') is False:
@@ -310,6 +314,8 @@ class CounterpartyBalanceCheck(CheckSpec):
             sold_by_commission[href] = sold_by_commission.get(href, 0) + r.get('sum', 0)
             owed_by_commission[href] = owed_by_commission.get(href, 0) + owed
             unpaid = owed - (r.get('payedSum') or 0)
+            if unpaid > 0 and (ctx.now - parse_moment(r['moment'])).days < _COMMISSION_PAYMENT_DAYS:
+                not_yet_due[href] = not_yet_due.get(href, 0) + unpaid
             if unpaid > 0:
                 unpaid_reports.setdefault(href, []).append({
                     'report': f'Отчёт комиссионера №{r.get("name")} от {(r.get("moment") or "")[:10]}',
@@ -417,6 +423,9 @@ class CounterpartyBalanceCheck(CheckSpec):
                     # маркетплейс платит реестром за период: долг по отгрузкам
                     # выравнивается следующей выплатой — это не потерянные деньги
                     pass
+                elif (on_commission and customer_balance > 0
+                        and customer_balance <= not_yet_due.get(href, 0) + self._BALANCE_THRESHOLD_KOPECKS):
+                    pass   # срок оплаты отчёта комиссионера ещё не наступил
                 elif (customer_balance < 0 and not on_commission
                         and -customer_balance <= awaiting_shipment + self._BALANCE_THRESHOLD_KOPECKS):
                     pass   # предоплата под открытый заказ покупателя — норма

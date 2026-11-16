@@ -4,6 +4,8 @@
 дубль платежей 00082/00086, нулевые этикетки в приёмке, основа по 52,20 при FIFO 60,27.
 """
 
+from datetime import datetime, timedelta
+
 import pytest
 
 from services.audit.checks.cross import RetroEditCheck
@@ -1165,6 +1167,32 @@ class TestCounterpartyBalance:
                                sum=854000, agent=agent)],
         }
         assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+    def _westpoint(self, report_age_days):
+        agent = self._agent('wp', 'Вест Поинт')
+        reported = (datetime.now() - timedelta(days=report_age_days)).strftime('%Y-%m-%d %H:%M:%S')
+        return {
+            'demand': [_doc('demand', 'd1', '00990', '2026-09-25 10:00:00',
+                            sum=4384000, agent=agent)],
+            'contract': [{'id': 'c4', 'contractType': 'Commission',
+                          'agent': {'meta': {'href': f'{MS}/entity/counterparty/wp'}},
+                          'meta': {'href': f'{MS}/entity/contract/c4'}}],
+            'commissionreportin': [_doc('commissionreportin', 'r4', '00021', reported,
+                                        sum=1815700, commitentSum=1271000, agent=agent)],
+        }
+
+    async def test_commission_report_within_payment_term_is_silent(self):
+        # Живой кейс Вест Поинта: отчёт 02.11, по договору месяц на оплату
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        data = self._westpoint(report_age_days=14)
+        assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+    async def test_commission_report_past_payment_term_is_debt(self):
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        data = self._westpoint(report_age_days=31)
+        found = await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None)
+        assert len(found) == 1
+        assert '12 710.00' in found[0].payload['signals'][0]
 
     async def test_marketplace_debt_is_not_a_problem(self):
         # Озон платит реестром за период — долг по отгрузкам выравнивается выплатой
