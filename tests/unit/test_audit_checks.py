@@ -647,30 +647,82 @@ class TestProductCodeScheme:
         assert 'Скотч прозрачный (архив)' in found[0].payload['products']
 
 
+def _service_meta(sid, name, code):
+    return {'name': name, 'code': code, 'meta': {'href': f'{MS}/entity/service/{sid}', 'type': 'service'}}
+
+
+PURCHASE_DELIVERY = _service_meta('d2', 'Доставка (для закупок)', '6-002')
+SALES_DELIVERY = _service_meta('d1', 'Доставка', '6-001')
+
+
+def _purchase(entity, doc_id, delivery, *, overhead=0, moment='2026-11-20 10:00:00', price=39500, discount=0):
+    return _doc(entity, doc_id, '00200', moment, overhead={'sum': overhead, 'distribution': 'price'},
+                positions={'rows': [
+                    {'price': 390000, 'quantity': 1, 'assortment': _product_meta('p1', 'Глиттер')},
+                    {'price': price, 'quantity': 1, 'discount': discount, 'assortment': delivery}]})
+
+
+async def _delivery_findings(*docs):
+    from services.audit.checks.cross import DeliveryAsPositionCheck
+    by_entity = {}
+    for doc in docs:
+        by_entity.setdefault(doc['meta']['type'], []).append(doc)
+    return await DeliveryAsPositionCheck().detect(FakeContext(FakeClient(by_entity)), None)
+
+
 class TestDeliveryAsPosition:
-    def _doc_with_delivery(self, doc_id, name, overhead=0):
-        return _doc('supply', doc_id, name, '2026-06-21 10:00:00', sum=1354000,
-                    overhead={'sum': overhead, 'distribution': 'price'},
-                    positions={'rows': [
-                        {'price': 139, 'quantity': 6000,
-                         'assortment': _product_meta('p1', 'БТМС (BTMS) 80%')},
-                        {'price': 100, 'quantity': 1000,
-                         'assortment': _product_meta('p2', 'Доставка (для закупок)')}]})
+    async def test_purchase_delivery_with_same_overhead_is_the_standard(self):
+        assert await _delivery_findings(_purchase('supply', 's1', PURCHASE_DELIVERY, overhead=39500)) == []
 
-    async def test_double_counted_delivery_exposed(self):
-        # Живой кейс 00051: доставка и позицией, и накладными расходами
-        from services.audit.checks.cross import DeliveryAsPositionCheck
-        ctx = FakeContext(FakeClient({'supply': [self._doc_with_delivery('s1', '00051', 100000)]}))
-        found = await DeliveryAsPositionCheck().detect(ctx, None)
-        assert len(found) == 1
-        assert found[0].payload['overhead_kopecks'] == 100000
+    async def test_purchase_delivery_in_order_is_fine(self):
+        assert await _delivery_findings(_purchase('purchaseorder', 'o1', PURCHASE_DELIVERY)) == []
 
-    async def test_delivery_without_overhead_marked(self):
-        # 00049: накладных нет — стоимость доставки не попала в себестоимость
+    async def test_delivery_without_overhead_not_in_cost(self):
+        [found] = await _delivery_findings(_purchase('supply', 's2', PURCHASE_DELIVERY))
         from services.audit.checks.cross import DeliveryAsPositionCheck
-        ctx = FakeContext(FakeClient({'supply': [self._doc_with_delivery('s2', '00049')]}))
-        found = await DeliveryAsPositionCheck().detect(ctx, None)
-        assert found[0].payload['overhead_kopecks'] == 0
+        assert found.payload['not_in_cost'] and not found.payload['wrong_service']
+        assert 'не попала в себестоимость' in DeliveryAsPositionCheck().explain(found.payload)
+        assert 'Отвязывать этот платёж от заказа не нужно' in found.payload['standard']
+
+    async def test_kopeck_rounding_is_not_a_finding(self):
+        assert await _delivery_findings(_purchase('supply', 's9', PURCHASE_DELIVERY, overhead=39450)) == []
+
+    async def test_renamed_purchase_delivery_still_checked_by_code(self):
+        renamed = _service_meta('d2', 'Логистика поставщика', '6-002')
+        [found] = await _delivery_findings(_purchase('supply', 's10', renamed))
+        assert found.payload['not_in_cost'] and not found.payload['wrong_service']
+
+    async def test_overhead_smaller_than_delivery(self):
+        [found] = await _delivery_findings(_purchase('supply', 's3', PURCHASE_DELIVERY, overhead=20000))
+        assert found.payload['delivery_kopecks'] == 39500 and found.payload['not_in_cost']
+
+    async def test_discount_counts_in_delivery_sum(self):
+        assert await _delivery_findings(_purchase('supply', 's4', PURCHASE_DELIVERY, overhead=37525, discount=5)) == []
+
+    async def test_sales_delivery_in_purchase_detected_even_with_overhead(self):
+        [found] = await _delivery_findings(_purchase('supply', 's5', SALES_DELIVERY, overhead=39500))
+        from services.audit.checks.cross import DeliveryAsPositionCheck
+        assert found.payload['wrong_service'] == ['Доставка'] and not found.payload['not_in_cost']
+        assert '6-002' in DeliveryAsPositionCheck().explain(found.payload)
+
+    async def test_both_reasons_explained(self):
+        from services.audit.checks.cross import DeliveryAsPositionCheck
+        [found] = await _delivery_findings(_purchase('supply', 's6', SALES_DELIVERY))
+        text = DeliveryAsPositionCheck().explain(found.payload)
+        assert '«Доставка»' in text and 'не попала в себестоимость' in text
+
+    async def test_goods_with_delivery_in_name_are_not_delivery(self):
+        bag = _product_meta('p9', 'Пакет курьерский для доставки')
+        assert await _delivery_findings(_purchase('supply', 's7', bag)) == []
+
+    async def test_documents_before_standard_are_history(self):
+        old = _purchase('supply', 's8', SALES_DELIVERY, moment='2026-07-04 10:00:00')
+        assert await _delivery_findings(old) == []
+
+    async def test_sales_documents_not_checked(self):
+        order = _doc('customerorder', 'c1', '00077', '2026-11-20 10:00:00',
+                     positions={'rows': [{'price': 100000, 'quantity': 1, 'assortment': SALES_DELIVERY}]})
+        assert await _delivery_findings(order) == []
 
 
 class TestRetroEdit:
@@ -1274,43 +1326,6 @@ class TestPaymentNoClosingDocs:
         fresh = (datetime.now() - timedelta(days=2)).strftime('%Y-%m-%d %H:%M:%S')
         ctx = FakeContext(FakeClient({'paymentout': [self._payment('00099', fresh)]}))
         assert await PaymentNoClosingDocsCheck().detect(ctx, None) == []
-
-
-class TestDeliveryAsPosition:
-    async def test_delivery_position_in_purchase_detected(self):
-        from services.audit.checks.cross import DeliveryAsPositionCheck
-        order = _doc('purchaseorder', 'o1', '00040', '2026-06-25 10:00:00',
-                     positions={'rows': [
-                         {'price': 150000, 'quantity': 10,
-                          'assortment': _product_meta('p1', 'Флакон 500 мл')},
-                         {'price': 100000, 'quantity': 1,
-                          'assortment': _product_meta('p2', 'Доставка')},
-                     ]})
-        ctx = FakeContext(FakeClient({'purchaseorder': [order]}))
-        found = await DeliveryAsPositionCheck().detect(ctx, None)
-        assert len(found) == 1
-        assert found[0].payload['delivery_positions'][0]['position'] == 'Доставка'
-
-    async def test_sales_documents_not_checked(self):
-        # Решение владельца: в заказах покупателей и отгрузках доставку не проверяем
-        from services.audit.checks.cross import DeliveryAsPositionCheck
-        order = _doc('customerorder', 'o1', '00077', '2026-06-25 10:00:00',
-                     positions={'rows': [
-                         {'price': 100000, 'quantity': 1,
-                          'assortment': _product_meta('p2', 'Доставка')},
-                     ]})
-        ctx = FakeContext(FakeClient({'customerorder': [order]}))
-        assert await DeliveryAsPositionCheck().detect(ctx, None) == []
-
-    async def test_no_delivery_silent(self):
-        from services.audit.checks.cross import DeliveryAsPositionCheck
-        order = _doc('purchaseorder', 'o2', '00041', '2026-06-25 10:00:00',
-                     positions={'rows': [
-                         {'price': 150000, 'quantity': 10,
-                          'assortment': _product_meta('p1', 'Флакон 500 мл')},
-                     ]})
-        ctx = FakeContext(FakeClient({'purchaseorder': [order]}))
-        assert await DeliveryAsPositionCheck().detect(ctx, None) == []
 
 
 class TestFifoChecks:

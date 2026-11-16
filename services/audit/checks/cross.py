@@ -307,16 +307,27 @@ class RetroEditCheck(CheckSpec):
                 f'FIFO и остатки на прошедшие даты.')
 
 
+PURCHASE_DELIVERY = 'Доставка (для закупок)'
+PURCHASE_DELIVERY_CODE = '6-002'
+DELIVERY_STANDARD_SINCE = '2026-11-16 00:00:00'
+OVERHEAD_TOLERANCE_KOPECKS = 100
+
+
+def _position_kopecks(position: dict) -> float:
+    return (position.get('price') or 0) * (position.get('quantity') or 0) * (1 - (position.get('discount') or 0) / 100)
+
+
+def _is_delivery(position: dict) -> bool:
+    assortment = position.get('assortment') or {}
+    if assortment.get('meta', {}).get('type') != 'service':
+        return False
+    return assortment.get('code') == PURCHASE_DELIVERY_CODE or 'доставк' in (assortment.get('name') or '').lower()
+
+
 class DeliveryAsPositionCheck(CheckSpec):
-    """Доставка добавлена товарной позицией в закупочный документ.
-
-    Принятый стандарт: в закупках доставка идёт накладными расходами приёмки,
-    позицией её быть не должно. Продажи (заказы покупателей, отгрузки)
-    НЕ проверяем — там своя сложная логика доставки, решение владельца."""
-
     id = 'delivery_as_position'
     section = Section.PURCHASES
-    title = 'Доставка добавлена позицией в закупочный документ'
+    title = 'Доставка в закупке оформлена не по стандарту'
 
     _ENTITIES = {
         'purchaseorder': 'Заказ поставщику',
@@ -324,28 +335,28 @@ class DeliveryAsPositionCheck(CheckSpec):
     }
 
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
-        filters = (f'updated>={format_moment(since)}' if since
-                   else f'moment>={ctx.scan_since_moment}')
+        start = max(format_moment(since) if since else ctx.scan_since_moment, DELIVERY_STANDARD_SINCE)
+        field = 'updated' if since else 'moment'
         out = []
         for entity, label in self._ENTITIES.items():
             docs = await ctx.client.list_entities(
                 ctx.session, entity,
-                filters=filters,
+                filters=f'{field}>={start}',
                 expand='positions.assortment',
                 order='moment,desc',
             )
             for d in docs:
-                delivery = []
-                for p in d.get('positions', {}).get('rows', []):
-                    a = p.get('assortment', {})
-                    name = (a.get('name') or '').lower()
-                    if 'доставк' in name:
-                        delivery.append({
-                            'position': a.get('name'),
-                            'quantity': p.get('quantity'),
-                            'price_kopecks': p.get('price'),
-                        })
+                if (d.get('moment') or '') < DELIVERY_STANDARD_SINCE:
+                    continue
+                delivery = [p for p in d.get('positions', {}).get('rows', []) if _is_delivery(p)]
                 if not delivery:
+                    continue
+                delivery_kopecks = round(sum(_position_kopecks(p) for p in delivery))
+                overhead = (d.get('overhead') or {}).get('sum', 0) or 0
+                wrong_service = [p['assortment'].get('name') for p in delivery
+                                 if p['assortment'].get('code') != PURCHASE_DELIVERY_CODE]
+                not_in_cost = entity == 'supply' and overhead + OVERHEAD_TOLERANCE_KOPECKS < delivery_kopecks
+                if not wrong_service and not not_in_cost:
                     continue
                 out.append(RawFinding(
                     entity_type=entity,
@@ -357,27 +368,33 @@ class DeliveryAsPositionCheck(CheckSpec):
                         'kind': label,
                         'moment': (d.get('moment') or '')[:16],
                         'description': (d.get('description') or '')[:300],
-                        'delivery_positions': delivery,
-                        # без этих двух полей нельзя отличить «доставку задвоили»
-                        # от «доставка не попала в себестоимость»
-                        'overhead_kopecks': (d.get('overhead') or {}).get('sum', 0) or 0,
-                        'positions_sum_kopecks': d.get('sum', 0) or 0,
-                        'note': ('Стандарт: доставка в закупке — накладные расходы '
-                                 'документа, а не товарная позиция. Если накладные '
-                                 'расходы (overhead_kopecks) НЕ нулевые, а позиция '
-                                 '«Доставка» всё равно есть — доставка учтена дважды: '
-                                 'в сумме документа и в себестоимости позиций. '
-                                 'Если накладные нулевые — стоимость доставки в '
-                                 'себестоимость сырья не попала, она занижена.'),
+                        'delivery_positions': [{'position': p['assortment'].get('name'), 'quantity': p.get('quantity'),
+                                                'price_kopecks': p.get('price'), 'discount': p.get('discount') or 0}
+                                               for p in delivery],
+                        'delivery_kopecks': delivery_kopecks,
+                        'overhead_kopecks': overhead,
+                        'document_sum_kopecks': d.get('sum', 0) or 0,
+                        'wrong_service': wrong_service,
+                        'not_in_cost': not_in_cost,
+                        'standard': (f'Доставка внутри счёта поставщика: позиция «{PURCHASE_DELIVERY}» '
+                                     f'(услуга {PURCHASE_DELIVERY_CODE}), в приёмке та же сумма в накладных, '
+                                     'один платёж на всю сумму счёта с привязкой к заказу. '
+                                     'Отвязывать этот платёж от заказа не нужно.'),
                     },
-                    fingerprint_salt='',
+                    fingerprint_salt='standard-2026-11-16',
                 ))
         return out
 
     def explain(self, payload: dict) -> str:
-        return ('В закупочном документе доставка оформлена товарной позицией. '
-                'По стандарту она идёт накладными расходами приёмки — '
-                'позиция-доставка искажает себестоимость и баланс поставщика.')
+        reasons = []
+        if payload.get('wrong_service'):
+            names = ', '.join(f'«{name}»' for name in payload['wrong_service'])
+            reasons.append(f'стоит {names} вместо «{PURCHASE_DELIVERY}» (услуга {PURCHASE_DELIVERY_CODE}); '
+                           'та услуга для продаж')
+        if payload.get('not_in_cost'):
+            reasons.append('в накладных расходах приёмки меньше суммы доставки, она не попала в себестоимость сырья')
+        return 'Доставка в закупке: ' + '; '.join(reasons) + '.'
+
 
 
 class StaleDocsCheck(CheckSpec):
