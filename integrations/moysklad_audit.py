@@ -55,12 +55,11 @@ class MoySkladAuditClient:
     async def get_by_href(self, session: aiohttp.ClientSession, href: str) -> dict | None:
         return await self.http.get(session, href)
 
-    async def stock_all(self, session: aiohttp.ClientSession, *, stock_mode: str = 'all') -> list[dict]:
+    async def stock_all(self, session: aiohttp.ClientSession, *, stock_mode: str = 'all',
+                        quantity_mode: str | None = None) -> list[dict]:
         """Отчёт остатков (вес 5). stockMode передаётся внутри filter — иначе игнорируется."""
-        data = await self.http.get(
-            session, '/report/stock/all',
-            f'limit=1000&filter={encode_filter(f"stockMode={stock_mode}")}',
-        )
+        modes = f"stockMode={stock_mode}" + (f";quantityMode={quantity_mode}" if quantity_mode else "")
+        data = await self.http.get(session, '/report/stock/all', f'limit=1000&filter={encode_filter(modes)}')
         return (data or {}).get('rows', [])
 
     async def stock_by_store_negative(self, session: aiohttp.ClientSession) -> list[dict]:

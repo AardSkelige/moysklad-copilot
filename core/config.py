@@ -68,6 +68,24 @@ AUDIT_PRODUCTION_STUCK_DAYS = int(os.getenv('AUDIT_PRODUCTION_STUCK_DAYS', '14')
 AUDIT_MAX_MESSAGES_PER_RUN = int(os.getenv('AUDIT_MAX_MESSAGES_PER_RUN', '10'))
 AUDIT_COMMENT_REVIEW_DAYS = int(os.getenv('AUDIT_COMMENT_REVIEW_DAYS', '30'))
 
+STOCK_ALERT_RECIPIENT_IDS: list[int] = []
+STOCK_ALERT_BAD_SETTINGS: list[str] = []
+for part in os.getenv('STOCK_ALERT_RECIPIENT_IDS', '').split(','):
+    if not part.strip():
+        continue
+    try:
+        STOCK_ALERT_RECIPIENT_IDS.append(int(part.strip()))
+    except ValueError:
+        STOCK_ALERT_BAD_SETTINGS.append(f'STOCK_ALERT_RECIPIENT_IDS: «{part.strip()}» не число, пропущено')
+try:
+    STOCK_ALERT_HOUR = int(os.getenv('STOCK_ALERT_HOUR', '9'))
+    if not 0 <= STOCK_ALERT_HOUR <= 23:
+        raise ValueError
+except ValueError:
+    STOCK_ALERT_BAD_SETTINGS.append(f'STOCK_ALERT_HOUR «{os.getenv("STOCK_ALERT_HOUR")}» не час 0–23, взято 9')
+    STOCK_ALERT_HOUR = 9
+STOCK_ALERT_SKIP_FOLDERS = ('Готовая продукция',)
+
 
 def validate_config():
     errors = []
@@ -100,6 +118,10 @@ def validate_config():
         )
     else:
         logger.info("Аудит учёта отключён (AUDIT_ENABLED=false или нет MOYSKLAD_TOKEN)")
+    for problem in STOCK_ALERT_BAD_SETTINGS:
+        logger.warning(problem)
+    if STOCK_ALERT_RECIPIENT_IDS:
+        logger.info(f"Сводка «ниже неснижаемого остатка» в {STOCK_ALERT_HOUR}:00, получателей {len(STOCK_ALERT_RECIPIENT_IDS)}")
 
 
 validate_config()

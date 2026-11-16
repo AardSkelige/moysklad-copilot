@@ -64,6 +64,10 @@ async def main():
         from services.audit.scheduler import setup_audit_scheduler
         setup_audit_scheduler(bot)
 
+    if config.STOCK_ALERT_RECIPIENT_IDS:
+        from services.stock_alerts import setup_stock_alerts
+        setup_stock_alerts(bot)
+
     await setup_bot_commands(bot)
 
     logger.info("Бот запущен и готов к работе!")
