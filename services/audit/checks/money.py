@@ -18,6 +18,32 @@ def _is_cancelled_order(status: str) -> bool:
     return any(m in low for m in _CANCELLED_ORDER_MARKERS)
 
 
+def _agent_href(doc: dict) -> str:
+    return ((doc.get('agent') or {}).get('meta') or {}).get('href', '').split('?')[0]
+
+
+def _days_apart(a: dict, b: dict) -> int | None:
+    try:
+        return abs((parse_moment(a['moment']) - parse_moment(b['moment'])).days)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _is_returned_overpayment(payment: dict, incoming: list, used: set, days: int) -> bool:
+    if ((payment.get('expenseItem') or {}).get('name') or '') != 'Возврат':
+        return False
+    agent = _agent_href(payment)
+    if not agent:
+        return False
+    for p in incoming:
+        apart = _days_apart(payment, p)
+        if (p.get('id') not in used and _agent_href(p) == agent and p.get('sum') == payment.get('sum')
+                and p.get('applicable') is not False and apart is not None and apart <= days):
+            used.add(p.get('id'))
+            return True
+    return False
+
+
 def _within_window(sorted_docs: list) -> list:
     """Оставить самую большую группу платежей, попарно ближе окна друг к другу."""
     best: list = []
@@ -204,7 +230,7 @@ class CounterpartyBalanceCheck(CheckSpec):
     _BALANCE_THRESHOLD_KOPECKS = 10000
 
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
-        async def _agent_sums(entity: str, key: str, acc: dict):
+        async def _agent_sums(entity: str, key: str, acc: dict, sign: int = 1):
             docs = await ctx.cached_list(
                 f'{entity}_balance_full', entity,
                 expand='agent', order='moment,desc', max_rows=2000,
@@ -223,7 +249,7 @@ class CounterpartyBalanceCheck(CheckSpec):
                 slot = acc.setdefault(href, {
                     'agent': (agent or {}).get('name', '?'),
                     'supplies': 0, 'paid_out': 0, 'demands': 0, 'paid_in': 0,
-                    'docs': [], 'unpaid_supplies': [],
+                    'docs': [], 'unpaid_supplies': [], 'goods_docs': 0,
                 })
                 amount = d.get('sum', 0)
                 unpaid = amount - (d.get('payedSum') or 0)
@@ -239,9 +265,11 @@ class CounterpartyBalanceCheck(CheckSpec):
                         'order_id': order_id,
                         'settled_by_owner': settled,
                     })
-                slot[key] += amount
+                slot[key] += sign * amount
+                if key in ('supplies', 'demands'):
+                    slot['goods_docs'] += 1
                 slot['docs'].append(f'{entity} №{d.get("name")} {d.get("moment", "")[:10]} '
-                                    f'{d.get("sum", 0) / 100:.2f}')
+                                    f'{sign * d.get("sum", 0) / 100:.2f}')
 
         acc: dict[str, dict] = {}
         await _agent_sums('supply', 'supplies', acc)
@@ -250,6 +278,8 @@ class CounterpartyBalanceCheck(CheckSpec):
         await _agent_sums('demand', 'demands', acc)
         await _agent_sums('paymentin', 'paid_in', acc)
         await _agent_sums('cashin', 'paid_in', acc)
+        await _agent_sums('salesreturn', 'demands', acc, sign=-1)
+        await _agent_sums('purchasereturn', 'supplies', acc, sign=-1)
 
         # Комиссионеры: отгрузка им — передача товара на реализацию, а не продажа.
         # Долг возникает по мере продаж, которые фиксирует отчёт комиссионера
@@ -348,9 +378,18 @@ class CounterpartyBalanceCheck(CheckSpec):
 
         order_comments = {o['id']: (o.get('description') or '')[:200] for o in orders}
 
+        adjustments: dict[str, int] = {}
+        for a in await ctx.cached_list('counterpartyadjustment_all', 'counterpartyadjustment',
+                                       expand='agent', order='moment,desc', max_rows=1000):
+            if a.get('applicable') is False:
+                continue
+            href = ((a.get('agent') or {}).get('meta') or {}).get('href', '').split('?')[0]
+            if href:
+                adjustments[href] = adjustments.get(href, 0) + (a.get('sum') or 0)
+
         out = []
         for href, s in acc.items():
-            if not s['supplies'] and not s['demands']:
+            if not s['goods_docs']:
                 # только платежи, товарных документов нет — операционные расходы
                 # (банк, подписки, доставка); взаиморасчёт по товарам не применим
                 continue
@@ -388,6 +427,10 @@ class CounterpartyBalanceCheck(CheckSpec):
                         f': {abs(customer_balance) / 100:,.2f} ₽'.replace(',', ' '))
             if not problems:
                 continue
+            adjustment = adjustments.get(href.split('?')[0], 0)
+            net_balance = supplier_balance + customer_balance - adjustment
+            if abs(net_balance) <= self._BALANCE_THRESHOLD_KOPECKS:
+                continue
             entity_id = href.split('/')[-1].split('?')[0]
             out.append(RawFinding(
                 entity_type='counterparty',
@@ -402,6 +445,8 @@ class CounterpartyBalanceCheck(CheckSpec):
                     'paid_out_rub': round(s['paid_out'] / 100, 2),
                     'demands_rub': round(s['demands'] / 100, 2),
                     'paid_in_rub': round(s['paid_in'] / 100, 2),
+                    'adjustments_rub': round(adjustment / 100, 2),
+                    'net_balance_rub': round(net_balance / 100, 2),
                     'on_commission': on_commission,
                     'sold_by_commission_rub': round(sold / 100, 2) if on_commission else None,
                     'goods_on_partner_shelf_rub': round(on_shelf / 100, 2) if on_commission else None,
@@ -477,19 +522,28 @@ class PaymentNoClosingDocsCheck(CheckSpec):
     supports_incremental = False
 
     _GRACE_DAYS = 7   # свежий аванс ещё ждёт свою приёмку — не сигналим
+    _REFUND_DAYS = 10
 
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
+        incoming = []
+        for entity in ('paymentin', 'cashin'):
+            incoming += await ctx.cached_list(
+                f'{entity}_balance_full', entity, expand='agent', order='moment,desc', max_rows=2000,
+            )
+        used: set = set()
         out = []
         for entity in ('paymentout', 'cashout'):
             docs = await ctx.cached_list(
-                f'{entity}_3m', entity,
+                f'{entity}_3m_items', entity,
                 filters=f'moment>={ctx.scan_since_moment}',
-                expand='agent', order='moment,desc',
+                expand='agent,expenseItem', order='moment,desc',
             )
             for d in docs:
                 if d.get('applicable') is False:
                     continue
                 if d.get('operations') or d.get('noClosingDocs'):
+                    continue
+                if _is_returned_overpayment(d, incoming, used, self._REFUND_DAYS):
                     continue
                 try:
                     age_days = (ctx.now - parse_moment(d['moment'])).days

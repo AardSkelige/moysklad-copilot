@@ -1609,3 +1609,102 @@ class TestProductionRetroEdit:
                           production_end='2026-07-04 16:57:00')
         ctx = FakeContext(FakeClient({'productiontask': [task]}))
         assert await ProductionRetroEditCheck().detect(ctx, None) == []
+
+
+def _agent_ref(href, name):
+    return {'name': name, 'meta': {'href': f'{MS}/entity/counterparty/{href}'}}
+
+
+class TestBalanceMatchesMoySklad:
+    async def test_adjustment_closes_old_overpayment(self):
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        agent = _agent_ref('ru', 'РУССО УПАК')
+        data = {
+            'supply': [_doc('supply', 's81', '00081', '2026-08-04 10:00:00', sum=1117000, agent=agent)],
+            'paymentout': [_doc('paymentout', 'p117', '00117', '2026-08-03 10:00:00', sum=1150000, agent=agent)],
+            'counterpartyadjustment': [_doc('counterpartyadjustment', 'ca1', '00001', '2026-11-16 11:49:00',
+                                            sum=33000, agent=agent)],
+        }
+        assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+    async def test_without_adjustment_overpayment_still_found(self):
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        agent = _agent_ref('ru', 'РУССО УПАК')
+        data = {
+            'supply': [_doc('supply', 's81', '00081', '2026-08-04 10:00:00', sum=1117000, agent=agent)],
+            'paymentout': [_doc('paymentout', 'p117', '00117', '2026-08-03 10:00:00', sum=1150000, agent=agent)],
+        }
+        assert len(await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None)) == 1
+
+    async def test_returned_double_payment_nets_to_zero(self):
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        agent = _agent_ref('dar', 'ИП Дарьина')
+        data = {
+            'demand': [_doc('demand', 'd934', '00934', '2026-10-20 10:00:00', sum=2665000, agent=agent)],
+            'paymentin': [
+                _doc('paymentin', 'i118', '00118', '2026-10-19 12:00:00', sum=2665000, agent=agent),
+                _doc('paymentin', 'i106', '00106', '2026-10-20 09:48:00', sum=2665000, agent=agent),
+            ],
+            'paymentout': [_doc('paymentout', 'p167', '00167', '2026-10-20 12:00:00', sum=2665000, agent=agent)],
+        }
+        assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+    async def test_sales_return_cancels_shipment(self):
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        agent = _agent_ref('dr', 'Дружинина')
+        data = {
+            'demand': [_doc('demand', 'd113', '00113', '2026-07-27 10:00:00', sum=458400, agent=agent)],
+            'salesreturn': [_doc('salesreturn', 'r6', '00006', '2026-09-21 10:00:00', sum=458400, agent=agent)],
+        }
+        assert await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None) == []
+
+
+class TestReturnedOverpayment:
+    def _refund(self, item='Возврат'):
+        return _doc('paymentout', 'p167', '00167', '2026-10-20 12:00:00', sum=2665000,
+                    agent=_agent_ref('dar', 'ИП Дарьина'), expenseItem={'name': item},
+                    paymentPurpose='Возврат повторного платежа по счету номер 00021')
+
+    def _incoming(self, moment='2026-10-19 12:00:00'):
+        return _doc('paymentin', 'i118', '00118', moment, sum=2665000, agent=_agent_ref('dar', 'ИП Дарьина'))
+
+    async def test_refund_of_double_payment_needs_no_flag(self):
+        from services.audit.checks.money import PaymentNoClosingDocsCheck
+        ctx = FakeContext(FakeClient({'paymentout': [self._refund()], 'paymentin': [self._incoming()]}))
+        assert await PaymentNoClosingDocsCheck().detect(ctx, None) == []
+
+    async def test_refund_without_matching_incoming_is_flagged(self):
+        from services.audit.checks.money import PaymentNoClosingDocsCheck
+        ctx = FakeContext(FakeClient({'paymentout': [self._refund()], 'paymentin': [self._incoming('2026-08-01 12:00:00')]}))
+        assert len(await PaymentNoClosingDocsCheck().detect(ctx, None)) == 1
+
+    async def test_other_item_with_same_incoming_is_flagged(self):
+        from services.audit.checks.money import PaymentNoClosingDocsCheck
+        ctx = FakeContext(FakeClient({'paymentout': [self._refund('Логистика')], 'paymentin': [self._incoming()]}))
+        assert len(await PaymentNoClosingDocsCheck().detect(ctx, None)) == 1
+
+    async def test_one_incoming_payment_excuses_only_one_refund(self):
+        from services.audit.checks.money import PaymentNoClosingDocsCheck
+        second = {**self._refund(), 'id': 'p168', 'name': '00168',
+                  'meta': {'href': f'{MS}/entity/paymentout/p168', 'type': 'paymentout'}}
+        ctx = FakeContext(FakeClient({'paymentout': [self._refund(), second], 'paymentin': [self._incoming()]}))
+        assert len(await PaymentNoClosingDocsCheck().detect(ctx, None)) == 1
+
+    async def test_cash_double_payment_also_counts(self):
+        from services.audit.checks.money import PaymentNoClosingDocsCheck
+        cash = {**self._incoming(), 'meta': {'href': f'{MS}/entity/cashin/i118', 'type': 'cashin'}}
+        ctx = FakeContext(FakeClient({'paymentout': [self._refund()], 'cashin': [cash]}))
+        assert await PaymentNoClosingDocsCheck().detect(ctx, None) == []
+
+
+class TestReturnedGoodsWithoutRefund:
+    async def test_customer_who_returned_goods_but_got_no_money_is_found(self):
+        from services.audit.checks.money import CounterpartyBalanceCheck
+        agent = _agent_ref('cu', 'Покупатель')
+        data = {
+            'demand': [_doc('demand', 'd1', '00200', '2026-09-01 10:00:00', sum=458400, agent=agent)],
+            'paymentin': [_doc('paymentin', 'i1', '00201', '2026-09-01 10:00:00', sum=458400, agent=agent)],
+            'salesreturn': [_doc('salesreturn', 'r1', '00007', '2026-09-21 10:00:00', sum=458400, agent=agent)],
+        }
+        [found] = await CounterpartyBalanceCheck().detect(FakeContext(FakeClient(data)), None)
+        assert found.payload['net_balance_rub'] == -4584.0
