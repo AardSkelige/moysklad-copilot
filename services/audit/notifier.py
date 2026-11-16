@@ -141,14 +141,14 @@ class AuditNotifier:
             logger.warning(f'[audit] не смог отправить дайджест: {e}')
 
     async def send_daily_summary(self, new_count: int):
-        """Утренняя сводка после ночного полного скана — даже если новых нет."""
+        """Ежедневная сводка после полного скана — даже если новых нет."""
         from sqlalchemy import func, select
         async with session_scope() as db:
             pending = (await db.execute(
                 select(func.count()).where(Finding.status.in_(
                     (FindingStatus.NEW, FindingStatus.NOTIFIED)))
             )).scalar_one()
-        lines = ['🌅 <b>Ночная проверка учёта завершена</b>\n']
+        lines = ['🔍 <b>Ежедневная проверка учёта завершена</b>\n']
         lines.append('Новых проблем не найдено 🎉' if new_count == 0
                      else f'Новых находок: <b>{new_count}</b> (прислал выше)')
         if pending:

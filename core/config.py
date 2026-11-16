@@ -57,7 +57,7 @@ AUDIT_ENABLED = os.getenv('AUDIT_ENABLED', 'true').lower() in ('1', 'true', 'yes
     and bool(MOYSKLAD_TOKEN) and bool(FINANCE_ADMIN_IDS)
 AUDIT_OWNER_TELEGRAM_ID = int(os.getenv('AUDIT_OWNER_TELEGRAM_ID', '0')) or FINANCE_ADMIN_ID
 AUDIT_INCREMENTAL_MINUTES = int(os.getenv('AUDIT_INCREMENTAL_MINUTES', '90'))
-AUDIT_FULL_HOUR = int(os.getenv('AUDIT_FULL_HOUR', '6'))
+AUDIT_FULL_HOUR = int(os.getenv('AUDIT_FULL_HOUR', '12'))
 AUDIT_SCAN_MONTHS = int(os.getenv('AUDIT_SCAN_MONTHS', '3'))
 AUDIT_RETRO_EDIT_HOURS = int(os.getenv('AUDIT_RETRO_EDIT_HOURS', '24'))
 # Свежим отгрузкам дают сутки: накладные расходы и комментарий часто вносят на следующий день

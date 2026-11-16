@@ -44,7 +44,7 @@ def setup_audit_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler.add_job(
         run_audit, 'cron',
         hour=config.AUDIT_FULL_HOUR, minute=0,
-        args=[bot, 'full', True],   # ночной скан всегда отчитывается сводкой
+        args=[bot, 'full', True],   # полный скан всегда отчитывается сводкой
         max_instances=1, coalesce=True,
         id='audit_full',
     )
