@@ -48,9 +48,8 @@ def _explained_as_free(payload_docs: list[dict], last_supply: dict | None) -> bo
         return True
     if any(is_free_supplier(d.get('agent')) for d in payload_docs):
         return True
-    comments = [(d.get('comment') or '') for d in payload_docs]
-    if last_supply:
-        comments.append(last_supply.get('comment') or '')
+    docs = [*payload_docs, *([last_supply] if last_supply else [])]
+    comments = [(d.get('comment') or '') for d in docs if not d.get('price_kopecks')]
     comments = [c for c in comments if c.strip()]
     if not comments:
         return False
