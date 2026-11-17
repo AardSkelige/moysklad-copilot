@@ -23,11 +23,13 @@ _MAX_BATCH_REPORTS = 60       # запрос партий только по ка
 # «нулевой суммы», «по нулевым ценам» — падежи перечислять бессмысленно
 _FREE_MARKERS = ('бесплатн', 'на пробу', 'подарок', 'подарен', 'нулев',
                  'даром', 'отдали', 'отдал')
+_ZERO_PRICE = re.compile(r'цена 0(?![,.]?\d)')
 
 
 def says_free(comment: str | None) -> bool:
     text = (comment or '').lower()
-    return any(m in text for m in (*_FREE_MARKERS, *FREE_SOURCE_MARKERS))
+    return (any(m in text for m in (*_FREE_MARKERS, *FREE_SOURCE_MARKERS))
+            or bool(_ZERO_PRICE.search(text)))
 
 
 def _previously_priced(sources: list[dict]) -> dict | None:
