@@ -127,6 +127,8 @@ async def _review_demands(docs: list[dict], llm: LLMClient,
                 elif new_comment and _goes_to_marketplace_batch(doc):
                     new_comment = None
             new_order_comment = (v.get('new_order_comment') or '').strip() or None
+            if new_order_comment and doc.get('order_locked'):
+                continue
             if new_order_comment:
                 new_order_comment = _keep_author(doc['order_comment'], new_order_comment)
             if new_order_comment and _only_final_dot(doc['order_comment'], new_order_comment):
@@ -153,7 +155,7 @@ async def apply_demand(item: dict):
         if item.get('new_comment') is not None:
             await client.update_entity(session, 'demand', item['id'],
                                        {'description': item['new_comment']})
-        if item.get('new_order_comment'):
+        if item.get('new_order_comment') and not item.get('order_locked'):
             await client.update_entity(session, 'customerorder', item['order_id'],
                                        {'description': item['new_order_comment']})
 
@@ -196,7 +198,7 @@ async def refine_demand(item: dict, instruction: str, llm: LLMClient | None = No
     if 'new_comment' in data and data['new_comment'] is not None:
         out['new_comment'] = _keep_author(item['comment'], data['new_comment'].strip())
     new_order_comment = (data.get('new_order_comment') or '').strip() or None
-    if new_order_comment:
+    if new_order_comment and not item.get('order_locked'):
         out['new_order_comment'] = _keep_author(item['order_comment'], new_order_comment)
     return out
 

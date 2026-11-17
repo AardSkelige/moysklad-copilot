@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 
 from core.logger import logger
 from integrations.moysklad_audit import MoySkladAuditClient
-from services.audit.context import delivery_method, format_moment
+from services.audit.context import delivery_method, format_moment, numbers_only_order
 from services.audit.team_context import GLOSSARY, TEAM_CONTEXT
 from services.llm_service import LLMClient
 from integrations.moysklad_base import new_session
@@ -95,6 +95,8 @@ async def collect_documents(days: int) -> tuple[list[dict], list[str]]:
                     'sum_rub': round(d.get('sum', 0) / 100, 2),
                     'comment': (d.get('description') or '').strip(),
                 }
+                if entity == 'customerorder' and numbers_only_order(doc['agent']):
+                    continue
                 if entity == 'demand' and _too_fresh(d.get('moment')):
                     # накладные расходы и комментарий часто вносят на следующий
                     # день — свежие отгрузки в ревью не берём, дойдут завтра
@@ -110,6 +112,7 @@ async def collect_documents(days: int) -> tuple[list[dict], list[str]]:
                         'order_id': order['id'],
                         'order_name': order.get('name'),
                         'order_comment': (order.get('description') or '').strip(),
+                        'order_locked': numbers_only_order(doc['agent']),
                     })
                 docs.append(doc)
     return docs, failed

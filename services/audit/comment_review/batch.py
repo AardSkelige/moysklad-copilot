@@ -25,6 +25,8 @@ async def collect_dot_fixes(days: int) -> list[dict]:
             ('comment', d['entity'], d['id'], d['comment']),
             ('order_comment', 'customerorder', d.get('order_id'), d.get('order_comment')),
         ):
+            if field == 'order_comment' and d.get('order_locked'):
+                continue
             if not entity_id or not needs_final_dot(text):
                 continue
             out.append({'entity': entity, 'id': entity_id,

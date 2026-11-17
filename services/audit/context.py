@@ -72,6 +72,11 @@ def is_marketplace(agent_name: str | None) -> bool:
         m.lower() in agent_name.lower() for m in MARKETPLACE_AGENTS)
 
 
+def numbers_only_order(agent_name: str | None) -> bool:
+    from services.audit.team_context import NUMBERS_ONLY_ORDER_AGENTS
+    return bool(agent_name) and any(m.lower() in agent_name.lower() for m in NUMBERS_ONLY_ORDER_AGENTS)
+
+
 def is_self_delivery(delivery: str | None) -> bool:
     """Самовывоз или доставка своими силами — накладных расходов не бывает."""
     from services.audit.team_context import SELF_DELIVERY_METHODS

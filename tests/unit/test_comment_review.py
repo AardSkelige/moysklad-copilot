@@ -415,3 +415,51 @@ class TestCollectReportsFailures:
         docs, failed = await cr.collect_documents(30)
         assert docs == []
         assert failed == ['Отгрузка']
+
+
+def _ozon_rows(entity):
+    agent = {'name': 'ООО "ИНТЕРНЕТ РЕШЕНИЯ"'}
+    if entity == 'customerorder':
+        return [{'id': 'o1', 'name': '01300', 'moment': '2026-11-16 20:04:00.000', 'sum': 99400,
+                 'agent': agent, 'description': '0222529800-0028-1\nii50244263585'}]
+    if entity == 'demand':
+        return [{'id': 'd1', 'name': '01290', 'moment': '2026-11-01 13:00:00.000', 'sum': 99400,
+                 'agent': agent, 'description': '',
+                 'customerOrder': {'id': 'o1', 'name': '01300', 'description': '0222529800-0028-1'}}]
+    return []
+
+
+@pytest.mark.unit
+class TestOzonOrdersKeepOnlyNumbers:
+    async def _collect(self, monkeypatch):
+        from services.audit import comment_review as cr
+
+        async def rows(self, session, entity, **kw):
+            return _ozon_rows(entity)
+
+        monkeypatch.setattr(cr.MoySkladAuditClient, 'list_entities', rows)
+        docs, _ = await cr.collect_documents(30)
+        return docs
+
+    async def test_ozon_order_is_not_reviewed(self, monkeypatch):
+        docs = await self._collect(monkeypatch)
+        assert [d['entity'] for d in docs] == ['demand']
+
+    async def test_ozon_order_gets_no_dot(self, monkeypatch):
+        from services.audit.comment_review import batch
+        docs = await self._collect(monkeypatch)
+
+        async def collected(days):
+            return docs, []
+
+        monkeypatch.setattr(batch, 'collect_documents', collected)
+        fixes = await batch.collect_dot_fixes(30)
+        assert all(f['entity'] != 'customerorder' for f in fixes)
+
+    async def test_demand_card_dropped_when_it_needs_the_ozon_order(self):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': '', 'new_order_comment': 'Лена: 0222529800-0028-1. Трек 123.',
+            'reason': 'перенос'}], ensure_ascii=False), 'tool_calls': []}])
+        demand = {**_demand(agent='ООО "ИНТЕРНЕТ РЕШЕНИЯ"', comment='трек 123',
+                            order_comment='0222529800-0028-1'), 'order_locked': True}
+        assert await review_documents([demand], llm=llm) == []
