@@ -177,6 +177,27 @@ class TestReviewFinance:
             'reason': 'добавлен автор'}], ensure_ascii=False), 'tool_calls': []}])
         assert await review_finance_documents([self._fin()], llm=llm) == []
 
+    async def test_payer_not_lost_when_moved_into_signature(self):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_purpose': 'Аренда',
+            'new_comment': 'Яна: аренда за сентябрь, платила наличными своими.',
+            'reason': 'стиль'}], ensure_ascii=False), 'tool_calls': []}])
+        doc = self._fin(purpose='', comment='Серёжа: аренда за сентябрь, платила Яна наличными.')
+        out = await review_finance_documents([doc], llm=llm)
+        assert out[0]['new_purpose'] == 'Аренда'
+        assert out[0]['new_comment'] is None
+
+    async def test_refine_keeps_payer(self):
+        from services.audit.comment_review import refine_finance
+        llm = FakeLLM([{'content': json.dumps({
+            'new_purpose': 'Аренда',
+            'new_comment': 'Яна: аренда за сентябрь, платила наличными своими.'},
+            ensure_ascii=False), 'tool_calls': []}])
+        item = {**self._fin(purpose='', comment='Серёжа: аренда за сентябрь, платила Яна наличными.'),
+                'new_purpose': 'Аренда', 'new_comment': 'Серёжа: аренда за сентябрь, платила наличными своими.'}
+        out = await refine_finance(item, 'Оставь имя Яны', llm=llm)
+        assert 'Яна' in out['new_comment']
+
     async def test_empty_purpose_still_filled(self):
         # назначение, в отличие от комментария, восстанавливается по привязкам платежа
         llm = FakeLLM([{'content': json.dumps([{

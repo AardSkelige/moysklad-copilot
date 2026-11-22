@@ -150,6 +150,8 @@ def _keep_author(current: str, proposed: str) -> str:
     was, now = _AUTHOR_RE.match(current or ''), _AUTHOR_RE.match(proposed or '')
     if not was or not now or was.group(1) == now.group(1):
         return proposed
+    if now.group(1) in current[was.end():]:
+        return current
     return proposed[:now.start(1)] + was.group(1) + proposed[now.end(1):]
 
 
