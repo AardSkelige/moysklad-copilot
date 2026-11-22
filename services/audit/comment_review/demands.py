@@ -129,6 +129,8 @@ async def _review_demands(docs: list[dict], llm: LLMClient,
                 elif new_comment and _left_to_insights(doc):
                     new_comment = None
             new_order_comment = (v.get('new_order_comment') or '').strip() or None
+            if from_integration(doc['order_comment']):
+                new_order_comment = None
             if new_order_comment and doc.get('order_locked'):
                 continue
             if new_order_comment:

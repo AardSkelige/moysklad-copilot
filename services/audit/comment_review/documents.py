@@ -17,6 +17,7 @@ from services.audit.comment_review.common import (
     _only_final_dot,
     _short_reason,
     _too_fresh,
+    from_integration,
 )
 from services.audit.comment_review.demands import _review_demands
 
@@ -126,6 +127,7 @@ async def review_documents(docs: list[dict], llm: LLMClient | None = None,
     и перенос в заказ); их заказы проверяются ТОЙ ЖЕ карточкой-парой и из общего
     потока исключаются — иначе две карточки правили бы один комментарий вразнобой."""
     llm = llm or LLMClient()
+    docs = [d for d in docs if not from_integration(d['comment'])]
     demands = [d for d in docs if d.get('kind') == 'demand']
     paired_orders = {d['order_id'] for d in demands}
     generic = [d for d in docs

@@ -344,6 +344,24 @@ class TestReviewDemands:
         payload = json.loads(seen_payloads[0])
         assert payload[0]['способ_доставки'] == 'СДЭК'
 
+    async def test_integration_order_skipped_in_generic_review(self):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'verdict': 'suggest',
+            'new_comment': 'Интеграция: интеграция — заказ с сайта №1709824491.',
+            'reason': 'добавлено имя автора'}], ensure_ascii=False), 'tool_calls': []}])
+        order = _doc(entity='customerorder', doc_id='o9', label='Заказ покупателя №01354',
+                     comment='Интеграция: заказ с сайта №1709824491.\nСДЭК, ПВЗ MSK650.')
+        assert await review_documents([order], llm=llm) == []
+        assert llm.calls == 0
+
+    async def test_integration_order_not_rewritten_from_demand(self):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': None,
+            'new_order_comment': 'Лена: интеграция — заказ с сайта №17.',
+            'reason': 'стиль'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_demand(comment='', order_comment='Интеграция: заказ с сайта №17.')]
+        assert await review_documents(docs, llm=llm) == []
+
     async def test_second_demand_of_same_order_does_not_touch_order(self):
         llm = FakeLLM([{'content': json.dumps([
             {'n': 0, 'new_comment': '', 'new_order_comment': 'Ира: всё в заказе.',
