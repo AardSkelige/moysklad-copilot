@@ -14,6 +14,7 @@ from integrations.moysklad_base import new_session
 from services.audit.comment_review.common import (
     DEMAND_MARKETPLACE_ZERO_COMMENT,
     Progress,
+    _AUTHOR_RE,
     _ask_batches,
     _batches,
     _keep_author,
@@ -139,6 +140,8 @@ async def _review_demands(docs: list[dict], llm: LLMClient,
                 new_order_comment = None
             if new_order_comment and doc['order_id'] in orders_touched:
                 new_order_comment = None
+            if new_comment == '' and not new_order_comment and not _already_in_order(doc):
+                new_comment = None
             if new_comment is None and new_order_comment is None:
                 continue
             if new_order_comment:
@@ -211,3 +214,8 @@ def _left_to_insights(doc: dict) -> bool:
 
 def _is_sdek(doc: dict) -> bool:
     return 'сдэк' in (doc.get('delivery_method') or '').lower()
+
+
+def _already_in_order(doc: dict) -> bool:
+    body = _normalized(_AUTHOR_RE.sub('', doc['comment'])).rstrip('.!…')
+    return bool(body) and body in _normalized(doc['order_comment'])

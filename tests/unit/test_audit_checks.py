@@ -350,6 +350,12 @@ class TestOrderSupplyOverdue:
         # Живой кейс №00056: статус «Заказано», предоплата есть, приёмок нет — норма
         assert await self._detect(self._order(days_ago=30, state_name='Заказано')) == []
 
+    @pytest.mark.parametrize('state_name', ['Подготовка', 'Ждём счёт'])
+    async def test_not_ordered_yet_silent(self, state_name):
+        order = self._order(days_ago=30, planned_in_days=-5, state_name=state_name)
+        order['payedSum'] = 0
+        assert await self._detect(order) == []
+
     async def test_planned_date_beats_awaiting_status(self):
         order = self._order(days_ago=30, planned_in_days=-5, state_name='Заказано')
         assert len(await self._detect(order)) == 1

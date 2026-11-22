@@ -354,8 +354,32 @@ class TestReviewDemands:
         docs = [_demand(doc_id='dm1', comment='мусор 1'),
                 _demand(doc_id='dm2', comment='мусор 2')]
         out = await review_documents(docs, llm=llm)
+        assert [s['id'] for s in out] == ['dm1']
         assert out[0]['new_order_comment'] == 'Ира: всё в заказе.'
-        assert out[1]['new_order_comment'] is None   # заказ правит только первая
+
+    async def test_reason_not_cleared_when_order_change_dropped(self):
+        llm = FakeLLM([{'content': json.dumps([
+            {'n': 0, 'new_comment': None,
+             'new_order_comment': 'Лена: трек-номер — LO-1. Поедет Яндексом.', 'reason': 'стиль'},
+            {'n': 1, 'new_comment': '',
+             'new_order_comment': 'Лена: трек-номер — LO-1. Поедет Яндексом. Пробники бесплатно.',
+             'reason': 'перенос'},
+        ], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_demand(doc_id='dm1', comment='', order_comment='Лена: трек-номер - LO-1. Поедет Яндексом.'),
+                _demand(doc_id='dm2', comment='Лена: пробники бесплатно.',
+                        order_comment='Лена: трек-номер - LO-1. Поедет Яндексом.')]
+        out = await review_documents(docs, llm=llm)
+        assert [s['id'] for s in out] == ['dm1']
+
+    async def test_duplicate_of_order_still_cleared(self):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': '', 'new_order_comment': None,
+            'reason': 'уже есть в заказе'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_demand(comment='Лена: пробники бесплатно.',
+                        order_comment='Лена: поедет Яндексом. Пробники бесплатно.')]
+        out = await review_documents(docs, llm=llm)
+        assert len(out) == 1
+        assert out[0]['new_comment'] == ''
 
 
 class TestApplyDemand:

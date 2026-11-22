@@ -144,6 +144,7 @@ class OrderSupplyOverdueCheck(CheckSpec):
     _NO_PLAN_GRACE = timedelta(days=3)
     # статус ожидания спасает только заказ без плановой даты
     _AWAITING_MARKERS = ('заказан', 'ожидан', 'в пути', 'новый')
+    _NOT_ORDERED = ('подготовка', 'ждем счет')
 
     async def detect(self, ctx: AuditContext, since: datetime | None) -> list[RawFinding]:
         docs = await ctx.client.list_entities(
@@ -159,6 +160,8 @@ class OrderSupplyOverdueCheck(CheckSpec):
             if not total or shipped >= total:
                 continue
             state = ((d.get('state') or {}).get('name') or '').strip()
+            if state.lower().replace('ё', 'е') in self._NOT_ORDERED:
+                continue
             planned = (d.get('deliveryPlannedMoment') or '')[:19]
             if not planned and any(m in state.lower() for m in self._AWAITING_MARKERS):
                 continue
