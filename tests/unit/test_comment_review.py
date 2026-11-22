@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from services.audit.comment_review import (apply_demand, needs_final_dot,
+from services.audit.comment_review import (apply_demand,
                                            review_documents, review_finance_documents)
 
 pytestmark = [pytest.mark.asyncio, pytest.mark.unit, pytest.mark.audit]
@@ -187,6 +187,19 @@ class TestReviewFinance:
         assert len(out) == 1
         assert out[0]['new_purpose'] == 'Заказ поставщику № 00074'
 
+    @pytest.mark.parametrize('comment', [
+        'Интеграция с Точкой',
+        'Интеграция с Точкой. Оплачено со счёта …1234, в МойСкладе его нет',
+    ])
+    async def test_bank_integration_payment_left_alone(self, comment):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_purpose': 'Банковские услуги', 'new_comment': None,
+            'reason': 'Уточнил назначение комиссии банка.'}], ensure_ascii=False), 'tool_calls': []}])
+        doc = {**self._fin(purpose='Комиссия за осуществление переводов через СБП', comment=comment),
+               'entity': 'paymentout'}
+        assert await review_finance_documents([doc], llm=llm) == []
+        assert llm.calls == 0
+
 
 class TestReviewDemands:
     """Отгрузки: комментарий только про накладные, остальное переносится в заказ."""
@@ -289,6 +302,14 @@ class TestReviewDemands:
             'reason': 'пояснение нуля'}], ensure_ascii=False), 'tool_calls': []}])
         assert await review_documents([_demand(agent='ООО Ozon')], llm=llm) == []
 
+    async def test_integration_comment_is_not_rewritten(self):
+        llm = FakeLLM([{'content': json.dumps([{
+            'n': 0, 'new_comment': 'Накладные расходы 0 — доставку оплачивает маркетплейс.',
+            'new_order_comment': None, 'reason': 'убрал лишнее'}], ensure_ascii=False), 'tool_calls': []}])
+        docs = [_demand(agent='ООО Ozon',
+                        comment='Интеграция: накладные расходы 0 — доставку оплачивает маркетплейс.')]
+        assert await review_documents(docs, llm=llm) == []
+
     async def test_marketplace_order_comment_still_shown(self):
         llm = FakeLLM([{'content': json.dumps([{
             'n': 0, 'new_comment': 'Накладные расходы 0 — доставку оплачивает маркетплейс.',
@@ -385,22 +406,6 @@ class TestDemandGrace:
 
 
 @pytest.mark.unit
-class TestNeedsFinalDot:
-    def test_missing_dot_after_name(self):
-        assert needs_final_dot('Ира: заказ 52050099-0627-1')
-
-    def test_dot_already_there(self):
-        assert not needs_final_dot('Ира: заказ 52050099-0627-1.')
-
-    def test_broken_format_is_not_a_dot_case(self):
-        # «Аня готовая пенка» нужна настоящая правка, а не механическая точка
-        assert not needs_final_dot('Аня готовая пенка')
-
-    def test_empty_comment(self):
-        assert not needs_final_dot('')
-
-
-@pytest.mark.unit
 class TestCollectReportsFailures:
     async def test_failed_entity_reported(self, monkeypatch):
         # МойСклад не ответил по части типов — сбор обязан сказать, по каким именно
@@ -444,17 +449,6 @@ class TestOzonOrdersKeepOnlyNumbers:
     async def test_ozon_order_is_not_reviewed(self, monkeypatch):
         docs = await self._collect(monkeypatch)
         assert [d['entity'] for d in docs] == ['demand']
-
-    async def test_ozon_order_gets_no_dot(self, monkeypatch):
-        from services.audit.comment_review import batch
-        docs = await self._collect(monkeypatch)
-
-        async def collected(days):
-            return docs, []
-
-        monkeypatch.setattr(batch, 'collect_documents', collected)
-        fixes = await batch.collect_dot_fixes(30)
-        assert all(f['entity'] != 'customerorder' for f in fixes)
 
     async def test_demand_card_dropped_when_it_needs_the_ozon_order(self):
         llm = FakeLLM([{'content': json.dumps([{

@@ -66,10 +66,6 @@ class CallbackData:
     AUDIT_COMMENT_APPLY = 'aud_cmt_ok'
     AUDIT_COMMENT_SKIP = 'aud_cmt_skip'
     AUDIT_COMMENT_STOP = 'aud_cmt_stop'
-    AUDIT_COMMENT_DOTS = 'aud_cmt_dots'        # показать список «не хватает точки»
-    AUDIT_COMMENT_DOTS_GO = 'aud_cmt_dots_go'  # применить их пачкой
-    AUDIT_COMMENT_MP = 'aud_cmt_mp'            # показать пустые отгрузки маркетплейсов
-    AUDIT_COMMENT_MP_GO = 'aud_cmt_mp_go'      # применить пачкой
 
 
 class CallbackPrefix:
@@ -81,7 +77,6 @@ class CallbackPrefix:
     AUDIT_TALK = 'aud_talk:'
     AUDIT_SECTION = 'aud_sec:'   # aud_sec:<индекс категории>:<offset>
     AUDIT_COMMENTS_GO = 'aud_cmt_go:'   # aud_cmt_go:<doc|fin>:<дней|0=вся история>
-    AUDIT_COMMENT_MP_DAYS = 'aud_cmt_mpd:'   # aud_cmt_mpd:<дней|0=вся история>
 
     SELECT_CATEGORY = 'cat_sel:'
     LIST_PAGE = 'list_page:'

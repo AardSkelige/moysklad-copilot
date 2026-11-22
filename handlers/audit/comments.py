@@ -15,9 +15,9 @@ from core import config
 from core.logger import logger
 from services.audit import review_tracker
 from services.audit.comment_review import (
-    apply_batch_comments, apply_comment, apply_demand, apply_finance,
-    collect_documents, collect_dot_fixes, collect_finance_documents,
-    collect_marketplace_zero_fixes, refine_comment, refine_demand,
+    apply_comment, apply_demand, apply_finance,
+    collect_documents, collect_finance_documents,
+    refine_comment, refine_demand,
     refine_finance, review_documents, review_finance_documents,
 )
 from shared import session_scope
@@ -39,10 +39,7 @@ _MENU_EXPLAIN = (
     'остальное бот предложит перенести в связанный заказ.\n'
     '💰 <b>Финансы</b> — платежи, ПКО/РКО. Проверяются два поля: '
     'назначение платежа и комментарий.\n\n'
-    '📍 <b>Расставить точки</b> — комментарии, которым не хватает только точки '
-    'в конце. Отдельными карточками они не показываются: правится пачкой.\n\n'
-    '📦 <b>Отгрузки маркетплейсов</b> — отгрузки Ozon/ПМТ/Яндекс.Маркету с нулевыми '
-    'накладными и пустым комментарием: ставит стандартную фразу пачкой, без карточек.\n\n'
+    'Точку в конце и комментарий отгрузок маркетплейсов каждую ночь ставит Инсайт.\n\n'
     'Выбери набор и период:'
 )
 
@@ -87,10 +84,6 @@ def _period_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f'💰 Финансы · {days} дн.', callback_data=f'{go}fin:{days}'),
             InlineKeyboardButton(text='💰 Финансы · вся история', callback_data=f'{go}fin:0'),
         ],
-        [InlineKeyboardButton(text='📍 Расставить точки',
-                              callback_data=CallbackData.AUDIT_COMMENT_DOTS)],
-        [InlineKeyboardButton(text='📦 Отгрузки маркетплейсов',
-                              callback_data=CallbackData.AUDIT_COMMENT_MP)],
         [InlineKeyboardButton(text='◀️ Назад', callback_data=CallbackData.AUDIT_MENU)],
     ])
 
@@ -218,8 +211,6 @@ async def on_comments_start(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(
             '⚠️ МойСклад не отдал часть документов: ' + ', '.join(failed) +
             '.\nЭти типы НЕ проверены — стоит повторить позже.')
-    if not is_finance:
-        await _offer_marketplace_batch(callback.message, days)
     if not failed and not suggestions:
         await callback.message.answer(
             f'Проверил {len(docs)} документов — все комментарии в порядке 🎉',
@@ -237,22 +228,6 @@ async def on_comments_start(callback: CallbackQuery, state: FSMContext):
         f'Проверил {len(docs)} документов, предлагаю поправить {len(suggestions)}. '
         f'Иду по типам документов, от старых к новым:')
     await _show_card(callback.message, state)
-
-
-async def _offer_marketplace_batch(message: Message, days: int):
-    try:
-        items = await collect_marketplace_zero_fixes(days)
-    except Exception:
-        logger.warning('[comments] не посчитал отгрузки маркетплейсов', exc_info=True)
-        return
-    if not items:
-        return
-    await message.answer(
-        f'📦 Ещё {len(items)} отгрузок маркетплейсов с пустым комментарием: '
-        f'карточками не показываю, проставлю стандартную фразу одной кнопкой.',
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-            text=f'📦 Проставить всем {len(items)}',
-            callback_data=f'{CallbackPrefix.AUDIT_COMMENT_MP_DAYS}{days}')]]))
 
 
 @router.message(AuditState.reviewing_comments, F.text, ~F.text.startswith('/'))
@@ -356,70 +331,3 @@ async def on_comment_stop(callback: CallbackQuery, state: FSMContext):
         f'👋 Закончили: заменено {applied}, оставлено {skipped}.',
         reply_markup=audit_menu_keyboard(),
     )
-
-
-async def _run_batch_fix(callback: CallbackQuery, collect, title: str,
-                         doing: str, nothing: str, done_text: str):
-    """Собрать документы и сразу записать правку — без промежуточного «Поставить?».
-
-    Правила механические и владелец их уже утвердил; второй шаг с подтверждением
-    только добавлял нажатие."""
-    await callback.answer()
-    from shared.keyboards import audit_menu_keyboard
-    progress = _ProgressMessage(await callback.message.answer(f'{title}…'))
-    try:
-        items = await collect(config.AUDIT_COMMENT_REVIEW_DAYS)
-        if not items:
-            await progress.finish(nothing, reply_markup=_period_keyboard())
-            return
-
-        async def on_item(n: int, total: int):
-            await progress.update(f'⏳ {doing}: {n} из {total}…')
-
-        await progress.update(f'⏳ {doing}: 0 из {len(items)}…')
-        done = await apply_batch_comments(items, progress=on_item)
-    except Exception as e:
-        logger.exception(f'batch comment fix failed: {title}')
-        await progress.finish(f'❌ Не получилось: {user_error_text(e)}',
-                              reply_markup=_period_keyboard())
-        return
-    tail = (f'\n⚠️ Не записались {len(items) - done} — МойСклад не принял, '
-            f'запусти ещё раз позже.' if done < len(items) else '')
-    await progress.finish(f'✅ {done_text}: {done} из {len(items)}.{tail}',
-                          reply_markup=audit_menu_keyboard())
-
-
-# *_GO — кнопки из старых сообщений с подтверждением: ведут туда же
-@router.callback_query(F.data.in_({CallbackData.AUDIT_COMMENT_DOTS,
-                                   CallbackData.AUDIT_COMMENT_DOTS_GO}))
-async def on_dots(callback: CallbackQuery):
-    """Поставить точку в конце комментариев, которым не хватает только её."""
-    await _run_batch_fix(callback, collect_dot_fixes,
-                         title='📍 Ищу комментарии без точки',
-                         doing='Ставлю точки',
-                         nothing='Все комментарии заканчиваются точкой 🎉',
-                         done_text='Точки поставлены')
-
-
-@router.callback_query(F.data.in_({CallbackData.AUDIT_COMMENT_MP,
-                                   CallbackData.AUDIT_COMMENT_MP_GO}))
-async def on_marketplace(callback: CallbackQuery):
-    """Проставить стандартный комментарий отгрузкам маркетплейсов с нулевыми накладными."""
-    await _run_batch_fix(callback, collect_marketplace_zero_fixes,
-                         title='📦 Собираю отгрузки маркетплейсов',
-                         doing='Проставляю комментарий',
-                         nothing='Все отгрузки маркетплейсов уже с комментарием 🎉',
-                         done_text='Проставлено')
-
-
-@router.callback_query(F.data.startswith(CallbackPrefix.AUDIT_COMMENT_MP_DAYS))
-async def on_marketplace_for_period(callback: CallbackQuery):
-    try:
-        days = int(callback.data[len(CallbackPrefix.AUDIT_COMMENT_MP_DAYS):])
-    except ValueError:
-        days = config.AUDIT_COMMENT_REVIEW_DAYS
-    await _run_batch_fix(callback, lambda _: collect_marketplace_zero_fixes(days),
-                         title='📦 Собираю отгрузки маркетплейсов',
-                         doing='Проставляю комментарий',
-                         nothing='Все отгрузки маркетплейсов уже с комментарием 🎉',
-                         done_text='Проставлено')

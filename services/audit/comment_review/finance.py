@@ -20,6 +20,7 @@ from services.audit.comment_review.common import (
     _ask_batches,
     _batches,
     _keep_author,
+    from_integration,
     _normalized,
     _only_final_dot,
     _short_reason,
@@ -136,7 +137,7 @@ async def review_finance_documents(docs: list[dict], llm: LLMClient | None = Non
                                    progress: Progress = None) -> list[dict]:
     llm = llm or LLMClient()
     suggestions = []
-    batches = _batches(docs)
+    batches = _batches([d for d in docs if not from_integration(d['comment'])])
     payloads = [[{
         'n': i,
         'документ': d['label'],

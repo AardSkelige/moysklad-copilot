@@ -20,6 +20,7 @@ from services.audit.comment_review.common import (
     _normalized,
     _only_final_dot,
     _short_reason,
+    from_integration,
 )
 
 
@@ -115,7 +116,7 @@ async def _review_demands(docs: list[dict], llm: LLMClient,
             new_comment = v.get('new_comment')
             if new_comment is not None:
                 new_comment = new_comment.strip()
-                if _normalized(new_comment) == _normalized(doc['comment']):
+                if from_integration(doc['comment']) or _normalized(new_comment) == _normalized(doc['comment']):
                     new_comment = None
                 # страховки кодом, что бы LLM ни решил:
                 elif not new_comment and 'накладн' in _normalized(doc['comment']):
@@ -124,7 +125,7 @@ async def _review_demands(docs: list[dict], llm: LLMClient,
                 elif new_comment and not doc['comment'] and _is_sdek(doc):
                     # СДЭК: единый сводный счёт — в пустую отгрузку ничего не пишем
                     new_comment = None
-                elif new_comment and _goes_to_marketplace_batch(doc):
+                elif new_comment and _left_to_insights(doc):
                     new_comment = None
             new_order_comment = (v.get('new_order_comment') or '').strip() or None
             if new_order_comment and doc.get('order_locked'):
@@ -203,7 +204,7 @@ async def refine_demand(item: dict, instruction: str, llm: LLMClient | None = No
     return out
 
 
-def _goes_to_marketplace_batch(doc: dict) -> bool:
+def _left_to_insights(doc: dict) -> bool:
     return (not doc['comment'] and not doc.get('overhead_rub')
             and is_marketplace(doc.get('agent')))
 
